@@ -30,11 +30,12 @@ echo "=============================================="
 mkdir -p logs
 
 # Load conda environment (adjust path if needed)
-if [ -f ~/miniconda3/etc/profile.d/conda.sh ]; then
-    source ~/miniconda3/etc/profile.d/conda.sh
+if [ -f /data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3 ]; then
+    source /data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3/etc/profile.d/conda.sh
 elif [ -f ~/anaconda3/etc/profile.d/conda.sh ]; then
     source ~/anaconda3/etc/profile.d/conda.sh
 fi
+
 conda activate dynamicvis
 
 # Load environment variables (AWS credentials, wandb key)
