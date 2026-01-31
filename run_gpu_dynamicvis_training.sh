@@ -1,13 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=DynamicVis_fMoW
+#SBATCH --job-name=AryanKashyapN
 #SBATCH --partition=small
-#SBATCH --gres=gpu:1g.24gb:1
+#SBATCH --gres=gpu:1g.24gb:0
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --output=logs/slurm_%j.out
-#SBATCH --error=logs/slurm_%j.err
-##SBATCH --time=24:00:00
+##SBATCH --time=00:10:00
 
 # =============================================================================
 # DynamicVis fMoW Training - SLURM Script
