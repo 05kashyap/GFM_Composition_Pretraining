@@ -156,6 +156,10 @@ train_dataloader = dict(
         local_manifest=local_manifest,
         split='train',
         pipeline=train_pipeline,
+        # Prefetching for efficient GPU utilization
+        enable_prefetch=True,
+        prefetch_size=128,  # Prefetch 128 images ahead
+        num_prefetch_workers=8,  # 8 parallel fetch threads
     ),
 )
 
@@ -173,6 +177,9 @@ val_dataloader = dict(
         local_manifest=local_manifest,
         split='val',
         pipeline=val_pipeline,
+        enable_prefetch=True,
+        prefetch_size=64,
+        num_prefetch_workers=4,
     ),
 )
 

@@ -57,7 +57,18 @@ fi
 
 conda activate dynamicvis
 
-# Set PYTHONPATH to include DynamicVis architecture
+# Check if DynamicVis is cloned (it's a separate git repo, not included in main repo)
+if [ ! -d "architectures/DynamicVis/dynamicvis" ]; then
+    echo "DynamicVis not found. Cloning..."
+    mkdir -p architectures
+    # Use the correct repo URL from DynamicVis README
+    git clone https://github.com/KyanChen/DynamicVis.git architectures/DynamicVis
+    echo "DynamicVis cloned successfully."
+else
+    echo "DynamicVis found at architectures/DynamicVis/"
+fi
+
+# Set PYTHONPATH to include DynamicVis architecture (after clone check)
 export PYTHONPATH="$(pwd):$(pwd)/architectures/DynamicVis:$PYTHONPATH"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
