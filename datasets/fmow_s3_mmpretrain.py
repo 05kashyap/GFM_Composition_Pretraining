@@ -413,14 +413,19 @@ class FMoWS3Dataset(BaseDataset):
         data_list = self.data_list
         num_samples = len(data_list)
         
+        # Guard against empty data list
+        if num_samples == 0:
+            return
+        
         # Generate list of upcoming S3 keys to prefetch
         upcoming_keys = []
-        for offset in range(1, self._prefetch_lookahead + 1):
+        for offset in range(1, min(self._prefetch_lookahead + 1, num_samples)):
             future_idx = (current_idx + offset) % num_samples
             upcoming_keys.append(data_list[future_idx]['s3_key'])
         
         # Submit for prefetching
-        self.prefetcher.prefetch(upcoming_keys)
+        if upcoming_keys:
+            self.prefetcher.prefetch(upcoming_keys)
     
     def prepare_data(self, idx: int) -> Dict:
         """Get data info by index and apply pipeline."""
