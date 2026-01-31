@@ -157,9 +157,10 @@ train_dataloader = dict(
         split='train',
         pipeline=train_pipeline,
         # Prefetching for efficient GPU utilization
+        # Buffer should be 3-4x batch_size to keep GPU fed
         enable_prefetch=True,
-        prefetch_size=128,  # Prefetch 128 images ahead
-        num_prefetch_workers=8,  # 8 parallel fetch threads
+        prefetch_size=1024,  # Prefetch ~4 batches ahead (for batch_size=256)
+        num_prefetch_workers=16,  # More threads for parallel S3 fetches
     ),
 )
 
@@ -178,8 +179,8 @@ val_dataloader = dict(
         split='val',
         pipeline=val_pipeline,
         enable_prefetch=True,
-        prefetch_size=64,
-        num_prefetch_workers=4,
+        prefetch_size=512,  # ~2 batches ahead for validation
+        num_prefetch_workers=8,
     ),
 )
 

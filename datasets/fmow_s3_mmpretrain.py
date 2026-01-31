@@ -314,8 +314,8 @@ class FMoWS3Dataset(BaseDataset):
         pipeline: List[Dict] = None,
         test_mode: bool = False,
         enable_prefetch: bool = True,
-        prefetch_size: int = 128,  # Prefetch 128 images ahead
-        num_prefetch_workers: int = 8,
+        prefetch_size: int = 1024,  # Prefetch ~4 batches ahead (for batch_size=256)
+        num_prefetch_workers: int = 16,  # More workers for parallel S3 fetches
         **kwargs
     ):
         self.bucket = bucket
