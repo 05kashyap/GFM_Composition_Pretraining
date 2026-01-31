@@ -30,13 +30,36 @@ echo "=============================================="
 mkdir -p logs
 
 # Load conda environment (adjust path if needed)
-if [ -f /data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3 ]; then
-    source /data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3/etc/profile.d/conda.sh
-elif [ -f ~/anaconda3/etc/profile.d/conda.sh ]; then
-    source ~/anaconda3/etc/profile.d/conda.sh
+# Try different possible conda locations
+CONDA_BASE=""
+if [ -d "/data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3" ]; then
+    CONDA_BASE="/data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3"
+elif [ -d "$HOME/miniconda3" ]; then
+    CONDA_BASE="$HOME/miniconda3"
+elif [ -d "$HOME/anaconda3" ]; then
+    CONDA_BASE="$HOME/anaconda3"
+fi
+
+if [ -n "$CONDA_BASE" ]; then
+    # Initialize conda for bash
+    __conda_setup="$("$CONDA_BASE/bin/conda" 'shell.bash' 'hook' 2> /dev/null)"
+    if [ $? -eq 0 ]; then
+        eval "$__conda_setup"
+    else
+        if [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+            . "$CONDA_BASE/etc/profile.d/conda.sh"
+        else
+            export PATH="$CONDA_BASE/bin:$PATH"
+        fi
+    fi
+    unset __conda_setup
 fi
 
 conda activate dynamicvis
+
+# Set PYTHONPATH to include DynamicVis architecture
+export PYTHONPATH="$(pwd):$(pwd)/architectures/DynamicVis:$PYTHONPATH"
+echo "PYTHONPATH set to: $PYTHONPATH"
 
 # Load environment variables (AWS credentials, wandb key)
 if [ -f .env ]; then
