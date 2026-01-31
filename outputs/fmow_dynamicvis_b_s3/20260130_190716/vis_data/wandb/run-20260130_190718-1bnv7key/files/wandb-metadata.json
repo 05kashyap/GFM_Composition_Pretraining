@@ -1,0 +1,28 @@
+{
+  "os": "Linux-6.11.0-29-generic-x86_64-with-glibc2.40",
+  "python": "CPython 3.11.14",
+  "startedAt": "2026-01-30T13:37:18.876650Z",
+  "args": [
+    "configs_dynamicvis/fmow_classification/dynamicvis_b_fmow_s3.py",
+    "--work-dir",
+    "outputs/fmow_dynamicvis_b_s3",
+    "--batch-size",
+    "16",
+    "--epochs",
+    "1",
+    "--lr",
+    "2e-4"
+  ],
+  "program": "/home/kashyap/Documents/Projects/SatBae/train_dynamicvis.py",
+  "codePath": "train_dynamicvis.py",
+  "codePathLocal": "train_dynamicvis.py",
+  "git": {
+    "remote": "https://github.com/05kashyap/SatBae.git",
+    "commit": "3558a718e936edecc697e7698a95a79449d3527d"
+  },
+  "email": "aryankashyapnaveen@gmail.com",
+  "root": "/home/kashyap/Documents/Projects/SatBae/outputs/fmow_dynamicvis_b_s3/20260130_190716/vis_data",
+  "host": "Kashyaps-ZephyrusG14",
+  "executable": "/home/kashyap/miniconda3/envs/dynamicvis/bin/python",
+  "writerId": "8gjpj35xq98vhq8kk1qay7eofuhhhdsx"
+}

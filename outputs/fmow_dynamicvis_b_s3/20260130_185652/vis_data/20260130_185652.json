@@ -1,0 +1,16 @@
+{"lr": 0.0001, "data_time": 0.07832050323486328, "grad_norm": Infinity, "loss": 4.421804904937744, "cls_loss": 4.421804904937744, "time": 0.20618157386779784, "epoch": 1, "iter": 20, "memory": 725, "step": 20}
+{"lr": 0.0001, "data_time": 0.13169188499450685, "grad_norm": 19.775393676757812, "loss": 4.363576745986938, "cls_loss": 4.363576745986938, "time": 0.2855435609817505, "epoch": 1, "iter": 40, "memory": 725, "step": 40}
+{"lr": 0.0001, "data_time": 0.17492029666900635, "grad_norm": 19.619375801086427, "loss": 4.416782569885254, "cls_loss": 4.416782569885254, "time": 0.3081038951873779, "epoch": 1, "iter": 60, "memory": 725, "step": 60}
+{"lr": 0.0001, "data_time": 0.062026357650756835, "grad_norm": 19.42962589263916, "loss": 4.3682554960250854, "cls_loss": 4.3682554960250854, "time": 0.20328788757324218, "epoch": 1, "iter": 80, "memory": 725, "step": 80}
+{"lr": 0.0001, "data_time": 0.11075928211212158, "grad_norm": 19.029647827148438, "loss": 4.410297298431397, "cls_loss": 4.410297298431397, "time": 0.2617481231689453, "epoch": 1, "iter": 100, "memory": 725, "step": 100}
+{"lr": 0.0001, "data_time": 0.06972651481628418, "grad_norm": 19.499867248535157, "loss": 4.175717687606811, "cls_loss": 4.175717687606811, "time": 0.2433626890182495, "epoch": 1, "iter": 120, "memory": 725, "step": 120}
+{"lr": 0.0001, "data_time": 0.09353551864624024, "grad_norm": 19.236894607543945, "loss": 4.173007297515869, "cls_loss": 4.173007297515869, "time": 0.26886558532714844, "epoch": 1, "iter": 140, "memory": 725, "step": 140}
+{"lr": 0.0001, "data_time": 0.3779457092285156, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.515083909034729, "epoch": 1, "iter": 160, "memory": 725, "step": 160}
+{"lr": 0.0001, "data_time": 1.194817566871643, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 1.8097461700439452, "epoch": 1, "iter": 180, "memory": 725, "step": 180}
+{"lr": 0.0001, "data_time": 1.2554622888565063, "grad_norm": 18.630848693847657, "loss": 4.282303786277771, "cls_loss": 4.282303786277771, "time": 1.389326310157776, "epoch": 1, "iter": 200, "memory": 725, "step": 200}
+{"lr": 0.0001, "data_time": 0.3961418390274048, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.5265373706817627, "epoch": 1, "iter": 220, "memory": 725, "step": 220}
+{"lr": 0.0001, "data_time": 0.7439220666885376, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.8688565969467164, "epoch": 1, "iter": 240, "memory": 725, "step": 240}
+{"lr": 0.0001, "data_time": 0.31331782341003417, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.43199183940887453, "epoch": 1, "iter": 260, "memory": 725, "step": 260}
+{"lr": 0.0001, "data_time": 0.11062662601470948, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.22573306560516357, "epoch": 1, "iter": 280, "memory": 725, "step": 280}
+{"lr": 0.0001, "data_time": 0.2917207956314087, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.4042598962783813, "epoch": 1, "iter": 300, "memory": 725, "step": 300}
+{"lr": 0.0001, "data_time": 0.05208945274353027, "grad_norm": NaN, "loss": NaN, "cls_loss": NaN, "time": 0.17011795043945313, "epoch": 1, "iter": 320, "memory": 725, "step": 320}

@@ -1,0 +1,51 @@
+{
+  "os": "Linux-6.11.0-29-generic-x86_64-with-glibc2.40",
+  "python": "CPython 3.11.14",
+  "startedAt": "2026-01-30T13:31:44.608147Z",
+  "args": [
+    "configs_dynamicvis/fmow_classification/dynamicvis_b_fmow_s3.py",
+    "--work-dir",
+    "outputs/fmow_dynamicvis_b_s3",
+    "--batch-size",
+    "8",
+    "--epochs",
+    "2",
+    "--lr",
+    "1e-4"
+  ],
+  "program": "/home/kashyap/Documents/Projects/SatBae/train_dynamicvis.py",
+  "codePath": "train_dynamicvis.py",
+  "codePathLocal": "train_dynamicvis.py",
+  "git": {
+    "remote": "https://github.com/05kashyap/SatBae.git",
+    "commit": "3558a718e936edecc697e7698a95a79449d3527d"
+  },
+  "email": "aryankashyapnaveen@gmail.com",
+  "root": "/home/kashyap/Documents/Projects/SatBae/outputs/fmow_dynamicvis_b_s3/20260130_190022/vis_data",
+  "host": "Kashyaps-ZephyrusG14",
+  "executable": "/home/kashyap/miniconda3/envs/dynamicvis/bin/python",
+  "cpu_count": 8,
+  "cpu_count_logical": 16,
+  "gpu": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "163926695936",
+      "used": "113808855040"
+    }
+  },
+  "memory": {
+    "total": "15597854720"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+      "memoryTotal": "4294967296",
+      "cudaCores": 2560,
+      "architecture": "Ampere",
+      "uuid": "GPU-078eff86-2cd6-be82-2523-9bb49b5b7799"
+    }
+  ],
+  "cudaVersion": "12.7",
+  "writerId": "1esep0ggwr4nj0h24l598sor481r2y63"
+}
