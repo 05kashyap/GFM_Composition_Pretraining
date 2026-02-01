@@ -1,10 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=AryanKashyapN
 #SBATCH --partition=small
-#SBATCH --gres=gpu:1g.24gb:0
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --gres=gpu:1g.24gb:2      # Request 2 GPUs (change to 1,2,4 as needed)
+#SBATCH --cpus-per-task=8         # More CPUs for data loading
+#SBATCH --mem=32G
 ##SBATCH --time=00:10:00
 
 # =============================================================================
@@ -158,17 +157,41 @@ if command -v nvidia-smi &> /dev/null; then
     nvidia-smi
 fi
 
+# Detect number of GPUs and remap CUDA_VISIBLE_DEVICES
+if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+    NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
+    # Remap to 0,1,2,... for PyTorch
+    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
+    echo "Detected $NUM_GPUS GPUs, remapped CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+else
+    NUM_GPUS=1
+    echo "CUDA_VISIBLE_DEVICES not set, assuming 1 GPU"
+fi
+
 echo ""
 echo "Starting training..."
 echo ""
 
-# Run training - using pretrain script for bbox-based training
-python train_dynamicvis_pretrain.py $CONFIG \
-    --work-dir $WORK_DIR \
-    --batch-size $BATCH_SIZE \
-    --epochs $EPOCHS \
-    --lr $LR \
-    $RESUME $NO_WANDB
+# Run training - use torchrun for multi-GPU, regular python for single GPU
+if [ "$NUM_GPUS" -gt 1 ]; then
+    echo "Using distributed training with $NUM_GPUS GPUs"
+    torchrun --nproc_per_node=$NUM_GPUS \
+        train_dynamicvis_pretrain.py $CONFIG \
+        --work-dir $WORK_DIR \
+        --batch-size $BATCH_SIZE \
+        --epochs $EPOCHS \
+        --lr $LR \
+        --launcher pytorch \
+        $RESUME $NO_WANDB
+else
+    echo "Using single GPU training"
+    python train_dynamicvis_pretrain.py $CONFIG \
+        --work-dir $WORK_DIR \
+        --batch-size $BATCH_SIZE \
+        --epochs $EPOCHS \
+        --lr $LR \
+        $RESUME $NO_WANDB
+fi
 
 echo ""
 echo "=============================================="
