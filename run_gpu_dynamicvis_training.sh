@@ -1,9 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=AryanKashyapN
 #SBATCH --partition=small
-#SBATCH --gres=gpu:1g.24gb:1      # 1 MIG slice (torchrun+NCCL has issues with multi-MIG)
-#SBATCH --cpus-per-task=4         # More CPUs for data loading
-#SBATCH --mem=32G
+#SBATCH --gres=gpu:1g.24gb:0
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
 ##SBATCH --time=00:10:00
 
 # =============================================================================
@@ -13,10 +14,12 @@
 # - Bounding box annotations (detection-style pretraining)
 # - FPN neck + RoI extraction
 # - Multi-instance learning (MIL) classification
-# - Streams data from AWS S3 (no need to download 350GB dataset)
+# - Can download data locally or stream from AWS S3
 #
 # Usage:
-#   sbatch run_gpu_dynamicvis_training.sh                     # Default training
+#   sbatch run_gpu_dynamicvis_training.sh                     # Default (stream from S3)
+#   sbatch run_gpu_dynamicvis_training.sh --download-data     # Download then train
+#   sbatch run_gpu_dynamicvis_training.sh --data-root /path   # Use existing local data
 #   sbatch run_gpu_dynamicvis_training.sh --epochs 50         # Custom epochs
 #   sbatch run_gpu_dynamicvis_training.sh --no-wandb          # Disable wandb
 #   sbatch run_gpu_dynamicvis_training.sh --resume            # Resume training
@@ -93,6 +96,9 @@ EPOCHS=200     # Official training uses 200 epochs
 LR=4e-4        # Official learning rate
 RESUME=""
 NO_WANDB=""
+DATA_ROOT=""           # Local data directory (if pre-downloaded)
+DOWNLOAD_DATA=false    # Whether to download data before training
+DATA_DIR="./data/fmow" # Default download location
 
 # Add SLURM job ID to work dir if running under SLURM
 if [ -n "$SLURM_JOB_ID" ]; then
@@ -135,6 +141,18 @@ while [[ $# -gt 0 ]]; do
             NO_WANDB="--no-wandb"
             shift
             ;;
+        --data-root)
+            DATA_ROOT="$2"
+            shift 2
+            ;;
+        --download-data)
+            DOWNLOAD_DATA=true
+            shift
+            ;;
+        --data-dir)
+            DATA_DIR="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
@@ -150,58 +168,64 @@ echo "  Batch size: $BATCH_SIZE"
 echo "  Epochs: $EPOCHS"
 echo "  Learning rate: $LR"
 echo "  WandB: $([ -z "$NO_WANDB" ] && echo "Enabled" || echo "Disabled")"
+echo "  Data source: $([ -n "$DATA_ROOT" ] && echo "Local ($DATA_ROOT)" || echo "S3 streaming")"
+echo "  Download data: $DOWNLOAD_DATA"
 echo ""
+
+# =============================================================================
+# Data Download (if requested)
+# =============================================================================
+if [ "$DOWNLOAD_DATA" = true ]; then
+    echo "=============================================="
+    echo "Downloading fMoW dataset..."
+    echo "=============================================="
+    echo "Target directory: $DATA_DIR"
+    echo "This will download ~35GB of msrgb images"
+    echo ""
+    
+    # Run the download script (non-interactive for SLURM)
+    python scripts/download_fmow.py \
+        --output-dir "$DATA_DIR" \
+        --split all \
+        --workers 32 <<< "y"
+    
+    if [ $? -eq 0 ]; then
+        echo "Download completed successfully!"
+        DATA_ROOT="$DATA_DIR"
+    else
+        echo "Download failed! Falling back to S3 streaming..."
+        DATA_ROOT=""
+    fi
+    echo ""
+fi
+
+# Build data root argument
+DATA_ROOT_ARG=""
+if [ -n "$DATA_ROOT" ]; then
+    if [ -d "$DATA_ROOT" ]; then
+        DATA_ROOT_ARG="--data-root $DATA_ROOT"
+        echo "Using local data from: $DATA_ROOT"
+    else
+        echo "WARNING: Data root '$DATA_ROOT' does not exist, using S3 streaming"
+    fi
+fi
 
 # Print GPU info
 if command -v nvidia-smi &> /dev/null; then
     nvidia-smi
 fi
 
-# Handle GPU detection and MIG compatibility
-# MIG (Multi-Instance GPU) slices don't work well with torchrun + NCCL
-# For MIG environments, use single GPU training for stability
-if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
-    NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
-    echo "Detected CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (${NUM_GPUS} device(s))"
-    
-    # Check if MIG is enabled (MIG devices cause issues with torchrun + NCCL)
-    if nvidia-smi -L 2>/dev/null | grep -q "MIG"; then
-        echo "MIG (Multi-Instance GPU) detected - using single GPU for stability"
-        echo "Note: torchrun + NCCL has known issues with MIG slices"
-        # Use only the first MIG slice
-        export CUDA_VISIBLE_DEVICES=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
-        NUM_GPUS=1
-        echo "Using single MIG slice: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-    fi
-else
-    NUM_GPUS=1
-    echo "CUDA_VISIBLE_DEVICES not set, assuming 1 GPU"
-fi
-
 echo ""
 echo "Starting training..."
 echo ""
 
-# Run training - use torchrun for multi-GPU, regular python for single GPU
-if [ "$NUM_GPUS" -gt 1 ]; then
-    echo "Using distributed training with $NUM_GPUS GPUs"
-    torchrun --nproc_per_node=$NUM_GPUS \
-        train_dynamicvis_pretrain.py $CONFIG \
-        --work-dir $WORK_DIR \
-        --batch-size $BATCH_SIZE \
-        --epochs $EPOCHS \
-        --lr $LR \
-        --launcher pytorch \
-        $RESUME $NO_WANDB
-else
-    echo "Using single GPU training"
-    python train_dynamicvis_pretrain.py $CONFIG \
-        --work-dir $WORK_DIR \
-        --batch-size $BATCH_SIZE \
-        --epochs $EPOCHS \
-        --lr $LR \
-        $RESUME $NO_WANDB
-fi
+# Run training - using pretrain script for bbox-based training
+python train_dynamicvis_pretrain.py $CONFIG \
+    --work-dir $WORK_DIR \
+    --batch-size $BATCH_SIZE \
+    --epochs $EPOCHS \
+    --lr $LR \
+    $RESUME $NO_WANDB $DATA_ROOT_ARG
 
 echo ""
 echo "=============================================="
