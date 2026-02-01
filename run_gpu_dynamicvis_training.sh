@@ -8,8 +8,14 @@
 ##SBATCH --time=00:10:00
 
 # =============================================================================
-# DynamicVis fMoW Training - SLURM Script
+# DynamicVis fMoW Pretraining - SLURM Script (with bounding boxes)
 # =============================================================================
+# This script trains DynamicVis from scratch using the official pretrain format:
+# - Bounding box annotations (detection-style pretraining)
+# - FPN neck + RoI extraction
+# - Multi-instance learning (MIL) classification
+# - Streams data from AWS S3 (no need to download 350GB dataset)
+#
 # Usage:
 #   sbatch run_gpu_dynamicvis_training.sh                     # Default training
 #   sbatch run_gpu_dynamicvis_training.sh --epochs 50         # Custom epochs
@@ -80,12 +86,12 @@ if [ -f .env ]; then
     echo "Loaded environment variables from .env"
 fi
 
-# Default values
-CONFIG="configs_dynamicvis/fmow_classification/dynamicvis_b_fmow_s3.py"
-WORK_DIR="outputs/fmow_dynamicvis_b_s3"
-BATCH_SIZE=32
-EPOCHS=100
-LR=1e-4
+# Default values - Using pretrain config with bounding boxes (like official weights)
+CONFIG="configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py"
+WORK_DIR="outputs/fmow_dynamicvis_b_s3_pretrain"
+BATCH_SIZE=16  # Smaller batch due to larger images + FPN
+EPOCHS=200     # Official training uses 200 epochs
+LR=4e-4        # Official learning rate
 RESUME=""
 NO_WANDB=""
 
@@ -156,8 +162,8 @@ echo ""
 echo "Starting training..."
 echo ""
 
-# Run training
-python train_dynamicvis.py $CONFIG \
+# Run training - using pretrain script for bbox-based training
+python train_dynamicvis_pretrain.py $CONFIG \
     --work-dir $WORK_DIR \
     --batch-size $BATCH_SIZE \
     --epochs $EPOCHS \
