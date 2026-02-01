@@ -11,14 +11,17 @@ of the fMoW validation set, reporting the same metrics used during training:
 - F1-Score (macro)
 
 Usage:
-    # Evaluate pretrained weights
+    # Evaluate pretrained weights (auto-detects architecture)
     python evaluate_dynamicvis.py --checkpoint /path/to/checkpoint.pth
     
     # Evaluate on a subset (faster)
     python evaluate_dynamicvis.py --checkpoint /path/to/checkpoint.pth --num-samples 5000
     
-    # Use specific batch size
-    python evaluate_dynamicvis.py --checkpoint /path/to/checkpoint.pth --batch-size 64
+    # Force simple architecture (for models trained with our config)
+    python evaluate_dynamicvis.py --checkpoint /path/to/checkpoint.pth --model-type simple
+    
+    # Force pretrain architecture (for official DynamicVis weights)
+    python evaluate_dynamicvis.py --checkpoint /path/to/checkpoint.pth --model-type pretrain
 """
 
 import argparse
@@ -42,33 +45,23 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 
-# Import after path setup
+# Import DynamicVis modules FIRST to register transforms
 import dynamicvis  # noqa: F401 - registers modules
-from datasets.fmow_s3_mmpretrain import FMoWS3Dataset, LoadImageFromS3, FMOW_CATEGORIES
+
+# Now import dataset module to register LoadImageFromS3
+from datasets import fmow_s3_mmpretrain  # noqa: F401 - registers LoadImageFromS3
+from datasets.fmow_s3_mmpretrain import FMoWS3Dataset, FMOW_CATEGORIES
 
 from mmengine.config import Config
-from mmengine.runner import Runner
 from mmengine.dataset import Compose
-from mmpretrain.registry import MODELS
-from mmpretrain.structures import DataSample
+from mmpretrain.registry import MODELS, TRANSFORMS
 
 
 def compute_metrics(all_preds: np.ndarray, all_labels: np.ndarray, all_scores: np.ndarray, num_classes: int):
-    """Compute evaluation metrics.
-    
-    Args:
-        all_preds: Predicted class indices (N,)
-        all_labels: Ground truth labels (N,)
-        all_scores: Prediction scores (N, num_classes)
-        num_classes: Number of classes
-        
-    Returns:
-        Dictionary of metrics
-    """
+    """Compute evaluation metrics."""
     from sklearn.metrics import (
         accuracy_score, top_k_accuracy_score,
         precision_score, recall_score, f1_score,
-        classification_report
     )
     
     metrics = {}
@@ -87,28 +80,15 @@ def compute_metrics(all_preds: np.ndarray, all_labels: np.ndarray, all_scores: n
     return metrics
 
 
-def build_model_from_config(config_path: str, checkpoint_path: str, device: str = 'cuda'):
-    """Build model from config and load checkpoint.
+def detect_model_type(checkpoint_path: str) -> str:
+    """Detect model architecture type from checkpoint.
     
-    Args:
-        config_path: Path to config file
-        checkpoint_path: Path to checkpoint file
-        device: Device to load model on
-        
     Returns:
-        Loaded model in eval mode
+        'pretrain' for official DynamicVis pretrained weights (with FPN)
+        'simple' for our simplified classification model
     """
-    cfg = Config.fromfile(config_path)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     
-    # Build model
-    model = MODELS.build(cfg.model)
-    model = model.to(device)
-    
-    # Load checkpoint
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Handle different checkpoint formats
     if 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
     elif 'model' in checkpoint:
@@ -116,7 +96,107 @@ def build_model_from_config(config_path: str, checkpoint_path: str, device: str 
     else:
         state_dict = checkpoint
     
-    # Remove 'module.' prefix if present (from DDP training)
+    # Check for FPN neck keys (pretrain model has pre_neck)
+    has_fpn = any('pre_neck' in k or 'neck.roi_layers' in k for k in state_dict.keys())
+    
+    # Check head input channels
+    head_weight_key = None
+    for k in state_dict.keys():
+        if 'head.fc.weight' in k or 'head.classifier.weight' in k:
+            head_weight_key = k
+            break
+    
+    if head_weight_key:
+        head_weight = state_dict[head_weight_key]
+        in_channels = head_weight.shape[1]
+        if in_channels == 256:
+            return 'pretrain'  # FPN output is 256
+        elif in_channels == 768:
+            return 'simple'  # Direct backbone output is 768
+    
+    if has_fpn:
+        return 'pretrain'
+    
+    return 'simple'
+
+
+def build_pretrain_model(checkpoint_path: str, num_classes: int = 63, img_size: int = 512, device: str = 'cuda'):
+    """Build the full DynamicVis pretrain model (with FPN neck).
+    
+    This matches the official pretrained weights architecture.
+    """
+    from mmpretrain.models import ImageClassifier
+    
+    # This model matches: pretrain_dynamicvis_b_bf16_mamba.py
+    model_cfg = dict(
+        type='mmpretrain.DynamicVisPretrainClassifier',
+        backbone=dict(
+            type='mmpretrain.DynamicVisBackbone',
+            arch='b',
+            path_type='forward_reverse_mean',
+            sampling_scale=dict(type='fixed', val=0.1),
+            global_token_cfg=dict(pos='head', num=-1),
+            is_softmax_on_x=True,
+            img_size=img_size,
+            patch_sizes=[7, 3, 3, 3],
+            strides=[4, 2, 2, 2],
+            spatial_token_keep_ratios=[8, 4, 2, 1],
+            out_indices=(0, 1, 2, 3),
+            out_type='featmap',
+        ),
+        pre_neck=dict(
+            type='FPN',
+            in_channels=[96, 192, 384, 768],
+            out_channels=256,
+            num_outs=5,
+        ),
+        neck=dict(
+            type='GenericRoIExtractor',
+            aggregation='sum',
+            roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=2, use_torchvision=True),
+            out_channels=256,
+            featmap_strides=[4, 8, 16, 32],
+            pre_cfg=dict(
+                type='ConvModule',
+                in_channels=256,
+                out_channels=256,
+                kernel_size=5,
+                padding=2,
+                inplace=False,
+            ),
+            post_cfg=dict(
+                type='GeneralizedAttention',
+                in_channels=256,
+                spatial_range=-1,
+                num_heads=6,
+                attention_type='0100',
+                kv_stride=2,
+            ),
+        ),
+        head=dict(
+            type='mmpretrain.DynamicVisPretrainClsHead',
+            num_classes=num_classes,
+            with_mil=True,
+            in_channels=256,
+            loss=dict(type='mmpretrain.LabelSmoothLoss', label_smooth_val=0.1, mode='original'),
+        ),
+    )
+    
+    model = MODELS.build(model_cfg)
+    model = model.to(device)
+    
+    # Load checkpoint
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
+    
+    # Remove 'module.' prefix if present
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith('module.'):
@@ -124,34 +204,25 @@ def build_model_from_config(config_path: str, checkpoint_path: str, device: str 
         else:
             new_state_dict[k] = v
     
-    # Load with strict=False to handle minor mismatches
     missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
     if missing:
-        print(f"Warning: Missing keys: {missing[:5]}..." if len(missing) > 5 else f"Warning: Missing keys: {missing}")
+        print(f"Missing keys ({len(missing)}): {missing[:3]}..." if len(missing) > 3 else f"Missing: {missing}")
     if unexpected:
-        print(f"Warning: Unexpected keys: {unexpected[:5]}..." if len(unexpected) > 5 else f"Warning: Unexpected keys: {unexpected}")
+        print(f"Unexpected keys ({len(unexpected)}): {unexpected[:3]}..." if len(unexpected) > 3 else f"Unexpected: {unexpected}")
     
     model.eval()
     return model
 
 
 def build_simple_model(checkpoint_path: str, num_classes: int = 63, img_size: int = 224, device: str = 'cuda'):
-    """Build a simple DynamicVis model without full config.
+    """Build a simple DynamicVis classifier (without FPN).
     
-    Args:
-        checkpoint_path: Path to checkpoint file
-        num_classes: Number of classes
-        img_size: Input image size
-        device: Device to load model on
-        
-    Returns:
-        Loaded model in eval mode
+    This matches our training config for fine-tuning.
     """
     from mmpretrain.models import ImageClassifier
-    from dynamicvis.models import DynamicVisBackbone, DynamicVisClsHead
     
-    # Build model matching the pretrain config
-    model = ImageClassifier(
+    model_cfg = dict(
+        type='ImageClassifier',
         backbone=dict(
             type='DynamicVisBackbone',
             arch='b',
@@ -175,13 +246,13 @@ def build_simple_model(checkpoint_path: str, num_classes: int = 63, img_size: in
         ),
     )
     
+    model = MODELS.build(model_cfg)
     model = model.to(device)
     
     # Load checkpoint
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Handle different checkpoint formats
     if 'state_dict' in checkpoint:
         state_dict = checkpoint['state_dict']
     elif 'model' in checkpoint:
@@ -189,7 +260,7 @@ def build_simple_model(checkpoint_path: str, num_classes: int = 63, img_size: in
     else:
         state_dict = checkpoint
     
-    # Remove 'module.' prefix if present
+    # Remove 'module.' prefix
     new_state_dict = {}
     for k, v in state_dict.items():
         if k.startswith('module.'):
@@ -197,7 +268,6 @@ def build_simple_model(checkpoint_path: str, num_classes: int = 63, img_size: in
         else:
             new_state_dict[k] = v
     
-    # Try to load, handling potential architecture mismatches
     try:
         missing, unexpected = model.load_state_dict(new_state_dict, strict=False)
         if missing:
@@ -218,29 +288,14 @@ def build_simple_model(checkpoint_path: str, num_classes: int = 63, img_size: in
     return model
 
 
-def create_val_dataset(num_samples: int = None, img_size: int = 224):
-    """Create validation dataset.
-    
-    Args:
-        num_samples: Number of samples to use (None for all)
-        img_size: Image size for transforms
-        
-    Returns:
-        Dataset and data info
-    """
-    from mmpretrain.datasets.transforms import (
-        ResizeEdge, CenterCrop, PackInputs
-    )
-    
+def create_val_dataset(img_size: int = 224):
+    """Create validation dataset."""
     val_pipeline = [
         dict(type='LoadImageFromS3', to_float32=True),
         dict(type='ResizeEdge', scale=int(img_size * 1.14), edge='short'),
         dict(type='CenterCrop', crop_size=img_size),
         dict(type='PackInputs'),
     ]
-    
-    # Build pipeline
-    pipeline = Compose(val_pipeline)
     
     dataset = FMoWS3Dataset(
         bucket='spacenet-dataset',
@@ -257,40 +312,55 @@ def create_val_dataset(num_samples: int = None, img_size: int = 224):
     return dataset
 
 
+def create_val_dataset_for_pretrain(img_size: int = 512):
+    """Create validation dataset for pretrain model (larger images)."""
+    bgr_mean = [103.53, 116.28, 123.675]  # BGR order
+    
+    val_pipeline = [
+        dict(type='LoadImageFromS3', to_float32=True),
+        dict(type='Resize', scale=(img_size, img_size), keep_ratio=True),
+        dict(type='Pad', size=(img_size, img_size), pad_val=dict(img=tuple(bgr_mean))),
+        dict(type='PackInputs'),
+    ]
+    
+    dataset = FMoWS3Dataset(
+        bucket='spacenet-dataset',
+        s3_prefix='Hosted-Datasets/fmow/fmow-rgb',
+        manifest_key='Hosted-Datasets/fmow/fmow-rgb/manifest.json.bz2',
+        local_manifest='data/manifest.json.bz2',
+        split='val',
+        pipeline=val_pipeline,
+        enable_prefetch=True,
+        prefetch_size=64,  # Larger images need less prefetch
+        num_prefetch_workers=4,
+    )
+    
+    return dataset
+
+
 def evaluate_model(
     model: nn.Module,
     dataset,
+    model_type: str,
     num_samples: int = None,
     batch_size: int = 32,
     num_workers: int = 4,
     device: str = 'cuda',
 ):
-    """Evaluate model on dataset.
-    
-    Args:
-        model: Model to evaluate
-        dataset: Evaluation dataset
-        num_samples: Number of samples to evaluate (None for all)
-        batch_size: Batch size
-        num_workers: Number of data loader workers
-        device: Device for evaluation
-        
-    Returns:
-        Dictionary of metrics
-    """
+    """Evaluate model on dataset."""
     from torch.utils.data import DataLoader, Subset
     import random
     
     # Subset if requested
-    if num_samples is not None and num_samples < len(dataset):
-        print(f"Using {num_samples} samples out of {len(dataset)}")
-        indices = random.sample(range(len(dataset)), num_samples)
+    total_samples = len(dataset)
+    if num_samples is not None and num_samples < total_samples:
+        print(f"Using {num_samples} samples out of {total_samples}")
+        indices = random.sample(range(total_samples), num_samples)
         dataset = Subset(dataset, indices)
     else:
-        num_samples = len(dataset)
+        num_samples = total_samples
         print(f"Evaluating on all {num_samples} samples")
     
-    # Create dataloader
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -300,7 +370,7 @@ def evaluate_model(
         drop_last=False,
     )
     
-    # Data preprocessor (normalization)
+    # Normalization
     mean = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1).to(device)
     std = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1).to(device)
     
@@ -313,78 +383,101 @@ def evaluate_model(
     with torch.no_grad():
         pbar = tqdm(dataloader, desc="Evaluating", unit="batch")
         for batch_idx, data in enumerate(pbar):
-            # Handle MMPretrain data format
-            if isinstance(data, dict):
-                inputs = data['inputs'].to(device).float()
-                # Get labels from data_samples
-                if 'data_samples' in data:
-                    labels = torch.tensor([ds.gt_label.item() for ds in data['data_samples']]).to(device)
-                else:
-                    labels = data.get('gt_label', data.get('labels')).to(device)
-            else:
-                inputs, labels = data
-                inputs = inputs.to(device).float()
-                labels = labels.to(device)
-            
-            # Normalize
-            inputs = (inputs - mean) / std
-            
-            # Forward pass
             try:
-                outputs = model(inputs)
-                
-                # Handle different output formats
-                if isinstance(outputs, (list, tuple)):
-                    logits = outputs[0] if isinstance(outputs[0], torch.Tensor) else outputs[0].cpu()
-                elif hasattr(outputs, 'head_outputs'):
-                    logits = outputs.head_outputs
-                elif isinstance(outputs, torch.Tensor):
-                    logits = outputs
+                # Handle MMPretrain data format
+                if isinstance(data, dict):
+                    inputs = data['inputs'].to(device).float()
+                    if 'data_samples' in data:
+                        labels = torch.tensor([ds.gt_label.item() for ds in data['data_samples']]).to(device)
+                    else:
+                        labels = data.get('gt_label', data.get('labels')).to(device)
                 else:
-                    # Try to extract from DataSample
-                    logits = outputs
+                    inputs, labels = data
+                    inputs = inputs.to(device).float()
+                    labels = labels.to(device)
                 
-                if isinstance(logits, torch.Tensor):
+                # Normalize
+                inputs = (inputs - mean) / std
+                
+                # Forward pass
+                if model_type == 'pretrain':
+                    # Pretrain model needs data_samples for the RoI head
+                    # Create dummy data samples with image metas
+                    from mmengine.structures import BaseDataElement
+                    batch_size_curr = inputs.shape[0]
+                    data_samples = []
+                    for i in range(batch_size_curr):
+                        ds = BaseDataElement()
+                        ds.set_metainfo({
+                            'img_shape': (inputs.shape[2], inputs.shape[3]),
+                            'ori_shape': (inputs.shape[2], inputs.shape[3]),
+                            'scale_factor': (1.0, 1.0),
+                        })
+                        data_samples.append(ds)
+                    
+                    outputs = model(inputs, data_samples=data_samples, mode='predict')
+                    
+                    # Extract predictions from data samples
+                    for i, ds in enumerate(outputs):
+                        if hasattr(ds, 'pred_score'):
+                            score = ds.pred_score.cpu().numpy()
+                            pred = score.argmax()
+                            all_scores.append(score)
+                            all_preds.append(pred)
+                            all_labels.append(labels[i].cpu().item())
+                else:
+                    # Simple model - direct forward pass
+                    outputs = model(inputs)
+                    
+                    # Handle different output formats
+                    if isinstance(outputs, (list, tuple)):
+                        logits = outputs[0]
+                    elif hasattr(outputs, 'head_outputs'):
+                        logits = outputs.head_outputs
+                    elif isinstance(outputs, torch.Tensor):
+                        logits = outputs
+                    else:
+                        continue
+                    
                     scores = torch.softmax(logits, dim=1)
                     preds = scores.argmax(dim=1)
                     
                     all_preds.extend(preds.cpu().numpy())
                     all_labels.extend(labels.cpu().numpy())
                     all_scores.extend(scores.cpu().numpy())
-                    
+                
+                # Update progress
+                if len(all_preds) > 0:
+                    current_acc = np.mean(np.array(all_preds) == np.array(all_labels)) * 100
+                    pbar.set_postfix({'acc': f'{current_acc:.2f}%'})
+                
             except Exception as e:
                 print(f"Error in batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
-            
-            # Update progress bar
-            if len(all_preds) > 0:
-                current_acc = np.mean(np.array(all_preds) == np.array(all_labels)) * 100
-                pbar.set_postfix({'acc': f'{current_acc:.2f}%'})
     
-    # Compute final metrics
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)
-    all_scores = np.array(all_scores)
+    all_scores = np.array(all_scores) if len(all_scores) > 0 else None
     
-    metrics = compute_metrics(all_preds, all_labels, all_scores, num_classes=63)
-    
-    return metrics
+    return compute_metrics(all_preds, all_labels, all_scores, num_classes=63)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Evaluate DynamicVis on fMoW')
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to model checkpoint')
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to config file (optional, will use default if not provided)')
+    parser.add_argument('--model-type', type=str, choices=['auto', 'simple', 'pretrain'], default='auto',
+                        help='Model architecture type (auto-detected by default)')
     parser.add_argument('--num-samples', type=int, default=None,
                         help='Number of samples to evaluate (default: all)')
-    parser.add_argument('--batch-size', type=int, default=32,
-                        help='Batch size for evaluation')
+    parser.add_argument('--batch-size', type=int, default=None,
+                        help='Batch size for evaluation (auto-set based on model type)')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loader workers')
-    parser.add_argument('--img-size', type=int, default=224,
-                        help='Input image size')
+    parser.add_argument('--img-size', type=int, default=None,
+                        help='Input image size (auto-set based on model type)')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device for evaluation')
     
@@ -395,12 +488,27 @@ def main():
         print(f"Error: Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
     
+    # Detect model type if auto
+    if args.model_type == 'auto':
+        print("Detecting model architecture...")
+        args.model_type = detect_model_type(args.checkpoint)
+        print(f"Detected model type: {args.model_type}")
+    
+    # Set defaults based on model type
+    if args.model_type == 'pretrain':
+        img_size = args.img_size or 512
+        batch_size = args.batch_size or 8  # Smaller for 512x512 images
+    else:
+        img_size = args.img_size or 224
+        batch_size = args.batch_size or 32
+    
     print("=" * 60)
     print("DynamicVis Evaluation on fMoW")
     print("=" * 60)
     print(f"Checkpoint: {args.checkpoint}")
-    print(f"Image size: {args.img_size}")
-    print(f"Batch size: {args.batch_size}")
+    print(f"Model type: {args.model_type}")
+    print(f"Image size: {img_size}")
+    print(f"Batch size: {batch_size}")
     print(f"Num samples: {args.num_samples or 'all'}")
     print(f"Device: {args.device}")
     print("=" * 60)
@@ -412,10 +520,10 @@ def main():
     
     # Build model
     print("\nLoading model...")
-    if args.config:
-        model = build_model_from_config(args.config, args.checkpoint, args.device)
+    if args.model_type == 'pretrain':
+        model = build_pretrain_model(args.checkpoint, num_classes=63, img_size=img_size, device=args.device)
     else:
-        model = build_simple_model(args.checkpoint, num_classes=63, img_size=args.img_size, device=args.device)
+        model = build_simple_model(args.checkpoint, num_classes=63, img_size=img_size, device=args.device)
     
     # Count parameters
     num_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -423,7 +531,10 @@ def main():
     
     # Create dataset
     print("\nLoading validation dataset...")
-    dataset = create_val_dataset(num_samples=args.num_samples, img_size=args.img_size)
+    if args.model_type == 'pretrain':
+        dataset = create_val_dataset_for_pretrain(img_size=img_size)
+    else:
+        dataset = create_val_dataset(img_size=img_size)
     
     # Evaluate
     print("\nStarting evaluation...")
@@ -432,8 +543,9 @@ def main():
     metrics = evaluate_model(
         model=model,
         dataset=dataset,
+        model_type=args.model_type,
         num_samples=args.num_samples,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         num_workers=args.num_workers,
         device=args.device,
     )
@@ -456,7 +568,6 @@ def main():
     print(f"{'Evaluation time':<25} {elapsed_time:>13.1f}s")
     print("=" * 60)
     
-    # Return metrics for programmatic use
     return metrics
 
 
