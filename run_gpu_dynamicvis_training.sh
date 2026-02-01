@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=AryanKashyapN
 #SBATCH --partition=small
-#SBATCH --gres=gpu:1g.24gb:2      # Request 2 GPUs (change to 1,2,4 as needed)
+#SBATCH --gres=gpu:1g.24gb:2      # Request 2 MIG slices
 #SBATCH --cpus-per-task=8         # More CPUs for data loading
 #SBATCH --mem=32G
 ##SBATCH --time=00:10:00
@@ -157,12 +157,15 @@ if command -v nvidia-smi &> /dev/null; then
     nvidia-smi
 fi
 
-# Detect number of GPUs from CUDA_VISIBLE_DEVICES
-# DO NOT remap - PyTorch handles the mapping automatically
-# SLURM sets CUDA_VISIBLE_DEVICES to physical IDs, PyTorch sees them as 0,1,2,...
+# Detect number of GPUs and remap CUDA_VISIBLE_DEVICES for MIG compatibility
+# MIG slices come as arbitrary IDs (like 3,4), but PyTorch expects 0,1,2,...
+# Remap BEFORE launching torchrun so all processes see the correct devices
 if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
     NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
-    echo "Detected $NUM_GPUS GPUs (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
+    echo "Original CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (${NUM_GPUS} GPUs)"
+    # Remap to 0,1,2,... - this works because CUDA driver handles the translation
+    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
+    echo "Remapped CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 else
     NUM_GPUS=1
     echo "CUDA_VISIBLE_DEVICES not set, assuming 1 GPU"
