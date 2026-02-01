@@ -253,6 +253,7 @@ class FMoWS3PretrainDataset(BaseDataset):
         enable_prefetch: bool = True,
         prefetch_size: int = 512,
         num_prefetch_workers: int = 8,
+        data_root: Optional[str] = None,  # Local data directory (for pre-downloaded data)
         **kwargs,
     ):
         self.bucket = bucket
@@ -265,14 +266,27 @@ class FMoWS3PretrainDataset(BaseDataset):
         self.enable_prefetch = enable_prefetch
         self.prefetch_size = prefetch_size
         self.num_prefetch_workers = num_prefetch_workers
+        self.data_root = Path(data_root) if data_root else None
+        
+        # Check if using local data
+        if self.data_root and self.data_root.exists():
+            print(f"Using local data from: {self.data_root}")
+            self.use_local = True
+        else:
+            if self.data_root:
+                print(f"WARNING: data_root {self.data_root} does not exist, falling back to S3")
+            self.use_local = False
         
         # Category mapping
         self.cat2label = {cat: i for i, cat in enumerate(FMOW_CATEGORIES)}
         self.label2cat = {i: cat for i, cat in enumerate(FMOW_CATEGORIES)}
         
-        # S3 client
-        use_credentials = bool(os.getenv("AWS_ACCESS_KEY_ID"))
-        self.s3_client = create_optimized_s3_client(use_credentials)
+        # S3 client (only needed if not using local data)
+        if not self.use_local:
+            use_credentials = bool(os.getenv("AWS_ACCESS_KEY_ID"))
+            self.s3_client = create_optimized_s3_client(use_credentials)
+        else:
+            self.s3_client = None
         
         # Initialize base dataset
         super().__init__(
@@ -317,19 +331,30 @@ class FMoWS3PretrainDataset(BaseDataset):
                 print(f"Prefetch error: {e}")
     
     def _fetch_sample(self, idx: int) -> Dict[str, Any]:
-        """Fetch a single sample from S3."""
+        """Fetch a single sample from local disk or S3."""
         sample_info = self.data_list[idx]
         img_key = sample_info['img_path']
         json_key = sample_info['json_path']
         
         try:
-            # Fetch image
-            img_obj = self.s3_client.get_object(Bucket=self.bucket, Key=img_key)
-            img_bytes = img_obj['Body'].read()
-            
-            # Fetch JSON annotation
-            json_obj = self.s3_client.get_object(Bucket=self.bucket, Key=json_key)
-            json_data = json.loads(json_obj['Body'].read().decode('utf-8'))
+            if self.use_local:
+                # Read from local disk
+                # img_key format: Hosted-Datasets/fmow/fmow-rgb/train/airport/...
+                # We need: {data_root}/train/airport/...
+                local_img_path = self.data_root / img_key.replace(f'{self.s3_prefix}/', '')
+                local_json_path = self.data_root / json_key.replace(f'{self.s3_prefix}/', '')
+                
+                with open(local_img_path, 'rb') as f:
+                    img_bytes = f.read()
+                with open(local_json_path, 'r') as f:
+                    json_data = json.load(f)
+            else:
+                # Fetch from S3
+                img_obj = self.s3_client.get_object(Bucket=self.bucket, Key=img_key)
+                img_bytes = img_obj['Body'].read()
+                
+                json_obj = self.s3_client.get_object(Bucket=self.bucket, Key=json_key)
+                json_data = json.loads(json_obj['Body'].read().decode('utf-8'))
             
             # Parse bounding boxes
             bboxes = []

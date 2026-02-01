@@ -88,6 +88,7 @@ def parse_args():
     parser.add_argument('--no-wandb', action='store_true', help='Disable wandb logging')
     parser.add_argument('--max-samples', type=int, help='Limit training samples (for debugging)')
     parser.add_argument('--use-rgb', action='store_true', help='Use full RGB images (larger) instead of msrgb')
+    parser.add_argument('--data-root', type=str, help='Local data directory (downloaded via scripts/download_fmow.py)')
     
     args = parser.parse_args()
     
@@ -197,6 +198,13 @@ def merge_args(cfg, args):
         cfg.train_dataloader.dataset.use_msrgb = False
         if cfg.get('val_dataloader'):
             cfg.val_dataloader.dataset.use_msrgb = False
+    
+    # Use local data directory (for pre-downloaded data)
+    if args.data_root:
+        cfg.train_dataloader.dataset.data_root = args.data_root
+        if cfg.get('val_dataloader'):
+            cfg.val_dataloader.dataset.data_root = args.data_root
+        print(f"Using local data from: {args.data_root}")
     
     # Merge cfg-options
     if args.cfg_options is not None:
