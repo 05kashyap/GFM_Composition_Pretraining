@@ -45,8 +45,14 @@ import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 
-# Import DynamicVis modules FIRST to register transforms
+# Import DynamicVis modules FIRST to register transforms and models
+# This includes the local mmdet with GenericRoIExtractor, FPN, etc.
 import dynamicvis  # noqa: F401 - registers modules
+
+# Import mmdet components from DynamicVis local copy
+from mmdet.models.roi_heads import GenericRoIExtractor  # noqa: F401
+from mmdet.models.necks import FPN  # noqa: F401
+from mmcv.cnn import GeneralizedAttention  # noqa: F401 - from mmcv
 
 # Now import dataset module to register LoadImageFromS3
 from datasets import fmow_s3_mmpretrain  # noqa: F401 - registers LoadImageFromS3
@@ -70,7 +76,9 @@ def compute_metrics(all_preds: np.ndarray, all_labels: np.ndarray, all_scores: n
     metrics['top1_accuracy'] = accuracy_score(all_labels, all_preds) * 100
     
     if all_scores is not None and num_classes > 5:
-        metrics['top5_accuracy'] = top_k_accuracy_score(all_labels, all_scores, k=5) * 100
+        # Need to specify labels since not all classes may be present in the sample
+        labels = list(range(num_classes))
+        metrics['top5_accuracy'] = top_k_accuracy_score(all_labels, all_scores, k=5, labels=labels) * 100
     
     # Precision, Recall, F1 (macro averaged)
     metrics['precision'] = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
@@ -124,65 +132,39 @@ def build_pretrain_model(checkpoint_path: str, num_classes: int = 63, img_size: 
     """Build the full DynamicVis pretrain model (with FPN neck).
     
     This matches the official pretrained weights architecture.
+    Uses mmengine with proper scope handling.
     """
-    from mmpretrain.models import ImageClassifier
+    from mmengine.config import Config
+    from mmengine.registry import init_default_scope, MODELS as ENGINE_MODELS
     
-    # This model matches: pretrain_dynamicvis_b_bf16_mamba.py
-    model_cfg = dict(
-        type='mmpretrain.DynamicVisPretrainClassifier',
-        backbone=dict(
-            type='mmpretrain.DynamicVisBackbone',
-            arch='b',
-            path_type='forward_reverse_mean',
-            sampling_scale=dict(type='fixed', val=0.1),
-            global_token_cfg=dict(pos='head', num=-1),
-            is_softmax_on_x=True,
-            img_size=img_size,
-            patch_sizes=[7, 3, 3, 3],
-            strides=[4, 2, 2, 2],
-            spatial_token_keep_ratios=[8, 4, 2, 1],
-            out_indices=(0, 1, 2, 3),
-            out_type='featmap',
-        ),
-        pre_neck=dict(
-            type='FPN',
-            in_channels=[96, 192, 384, 768],
-            out_channels=256,
-            num_outs=5,
-        ),
-        neck=dict(
-            type='GenericRoIExtractor',
-            aggregation='sum',
-            roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=2, use_torchvision=True),
-            out_channels=256,
-            featmap_strides=[4, 8, 16, 32],
-            pre_cfg=dict(
-                type='ConvModule',
-                in_channels=256,
-                out_channels=256,
-                kernel_size=5,
-                padding=2,
-                inplace=False,
-            ),
-            post_cfg=dict(
-                type='GeneralizedAttention',
-                in_channels=256,
-                spatial_range=-1,
-                num_heads=6,
-                attention_type='0100',
-                kv_stride=2,
-            ),
-        ),
-        head=dict(
-            type='mmpretrain.DynamicVisPretrainClsHead',
-            num_classes=num_classes,
-            with_mil=True,
-            in_channels=256,
-            loss=dict(type='mmpretrain.LabelSmoothLoss', label_smooth_val=0.1, mode='original'),
-        ),
-    )
+    # Use the original DynamicVis pretrain config
+    config_path = Path(__file__).parent / "architectures" / "DynamicVis" / "configs_DynamicVis" / "fMoW" / "pretrain_dynamicvis_b_bf16_mamba.py"
     
-    model = MODELS.build(model_cfg)
+    if config_path.exists():
+        print(f"Loading model from config: {config_path}")
+        cfg = Config.fromfile(str(config_path))
+        
+        # Override image size if needed
+        if img_size != 512:
+            cfg.model.backbone.img_size = img_size
+        
+        # IMPORTANT: The data_preprocessor is defined at top-level in config,
+        # but ImageClassifier expects it inside the model config.
+        # MMEngine Runner normally handles this, but we need to do it manually.
+        if 'data_preprocessor' in cfg and cfg.model.get('data_preprocessor') is None:
+            cfg.model['data_preprocessor'] = cfg.data_preprocessor
+        
+        # Initialize mmdet scope as specified in the config
+        init_default_scope('mmdet')
+        
+        # Build model using mmengine's generic MODELS registry (respects default scope)
+        model = ENGINE_MODELS.build(cfg.model)
+    else:
+        raise FileNotFoundError(
+            f"Config not found at {config_path}. "
+            "The pretrain model requires the original DynamicVis config file."
+        )
+    
     model = model.to(device)
     
     # Load checkpoint
@@ -361,6 +343,9 @@ def evaluate_model(
         num_samples = total_samples
         print(f"Evaluating on all {num_samples} samples")
     
+    # Use mmpretrain's collate function for DataSample objects
+    from mmengine.dataset import pseudo_collate
+    
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -368,9 +353,10 @@ def evaluate_model(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=False,
+        collate_fn=pseudo_collate,  # Handles DataSample objects
     )
     
-    # Normalization
+    # Normalization for pretrain model (DetDataPreprocessor handles this differently)
     mean = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1).to(device)
     std = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1).to(device)
     
@@ -384,38 +370,81 @@ def evaluate_model(
         pbar = tqdm(dataloader, desc="Evaluating", unit="batch")
         for batch_idx, data in enumerate(pbar):
             try:
-                # Handle MMPretrain data format
+                # pseudo_collate returns a dict with lists:
+                # {'inputs': [tensor, tensor, ...], 'data_samples': [DataSample, ...]}
                 if isinstance(data, dict):
-                    inputs = data['inputs'].to(device).float()
+                    # Stack inputs (list of tensors -> batched tensor)
+                    if isinstance(data['inputs'], list):
+                        inputs = torch.stack(data['inputs']).to(device).float()
+                    else:
+                        inputs = data['inputs'].to(device).float()
+                    
+                    # Collect labels from data_samples
                     if 'data_samples' in data:
-                        labels = torch.tensor([ds.gt_label.item() for ds in data['data_samples']]).to(device)
+                        data_samples_list = data['data_samples']
+                        labels = []
+                        for ds in data_samples_list:
+                            if hasattr(ds, 'gt_label'):
+                                labels.append(ds.gt_label.item())
+                        labels = torch.tensor(labels).to(device)
                     else:
                         labels = data.get('gt_label', data.get('labels')).to(device)
+                        data_samples_list = None
+                elif isinstance(data, list):
+                    # Old format: list of dicts
+                    inputs_list = [d['inputs'] for d in data]
+                    inputs = torch.stack(inputs_list).to(device).float()
+                    
+                    labels = []
+                    data_samples_list = []
+                    for d in data:
+                        ds = d['data_samples']
+                        if hasattr(ds, 'gt_label'):
+                            labels.append(ds.gt_label.item())
+                        data_samples_list.append(ds)
+                    labels = torch.tensor(labels).to(device)
                 else:
                     inputs, labels = data
                     inputs = inputs.to(device).float()
                     labels = labels.to(device)
-                
-                # Normalize
-                inputs = (inputs - mean) / std
+                    data_samples_list = None
                 
                 # Forward pass
                 if model_type == 'pretrain':
-                    # Pretrain model needs data_samples for the RoI head
-                    # Create dummy data samples with image metas
-                    from mmengine.structures import BaseDataElement
-                    batch_size_curr = inputs.shape[0]
-                    data_samples = []
-                    for i in range(batch_size_curr):
-                        ds = BaseDataElement()
-                        ds.set_metainfo({
-                            'img_shape': (inputs.shape[2], inputs.shape[3]),
-                            'ori_shape': (inputs.shape[2], inputs.shape[3]),
-                            'scale_factor': (1.0, 1.0),
-                        })
-                        data_samples.append(ds)
+                    # For pretrain model, we need to add full-image bboxes to data_samples
+                    # because the model uses RoI extraction
+                    from mmdet.structures import DetDataSample
+                    from mmengine.structures import InstanceData
                     
-                    outputs = model(inputs, data_samples=data_samples, mode='predict')
+                    h, w = inputs.shape[2], inputs.shape[3]
+                    batch_size_curr = inputs.shape[0]
+                    
+                    # Create DetDataSample with full-image bbox for each sample
+                    det_samples = []
+                    for i in range(batch_size_curr):
+                        det_sample = DetDataSample()
+                        # Full image bbox: [x1, y1, x2, y2]
+                        bbox = torch.tensor([[0, 0, w, h]], dtype=torch.float32, device=device)
+                        gt_instances = InstanceData()
+                        gt_instances.bboxes = bbox
+                        gt_instances.labels = torch.tensor([labels[i].item()], dtype=torch.long, device=device)
+                        det_sample.gt_instances = gt_instances
+                        det_sample.set_metainfo({
+                            'img_shape': (h, w),
+                            'ori_shape': (h, w),
+                            'scale_factor': (1.0, 1.0),
+                            'batch_input_shape': (h, w),
+                        })
+                        det_samples.append(det_sample)
+                    
+                    # Use the model's data_preprocessor
+                    batch_inputs = model.data_preprocessor({'inputs': inputs, 'data_samples': det_samples})
+                    
+                    # Get processed inputs and samples
+                    processed_inputs = batch_inputs['inputs']
+                    processed_samples = batch_inputs.get('data_samples', det_samples)
+                    
+                    outputs = model(processed_inputs, data_samples=processed_samples, mode='predict')
                     
                     # Extract predictions from data samples
                     for i, ds in enumerate(outputs):
@@ -426,7 +455,8 @@ def evaluate_model(
                             all_preds.append(pred)
                             all_labels.append(labels[i].cpu().item())
                 else:
-                    # Simple model - direct forward pass
+                    # Simple model - normalize and forward
+                    inputs = (inputs - mean) / std
                     outputs = model(inputs)
                     
                     # Handle different output formats
@@ -529,8 +559,11 @@ def main():
     num_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model parameters: {num_params:.2f}M")
     
-    # Create dataset
+    # Create dataset - need to switch back to mmpretrain scope for transforms
     print("\nLoading validation dataset...")
+    from mmengine.registry import init_default_scope
+    init_default_scope('mmpretrain')  # Reset scope for dataset transforms
+    
     if args.model_type == 'pretrain':
         dataset = create_val_dataset_for_pretrain(img_size=img_size)
     else:
