@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=AryanKashyapN
 #SBATCH --partition=small
-#SBATCH --gres=gpu:1g.24gb:2      # Request 2 MIG slices
-#SBATCH --cpus-per-task=8         # More CPUs for data loading
+#SBATCH --gres=gpu:1g.24gb:1      # 1 MIG slice (torchrun+NCCL has issues with multi-MIG)
+#SBATCH --cpus-per-task=4         # More CPUs for data loading
 #SBATCH --mem=32G
 ##SBATCH --time=00:10:00
 
@@ -157,15 +157,22 @@ if command -v nvidia-smi &> /dev/null; then
     nvidia-smi
 fi
 
-# Detect number of GPUs and remap CUDA_VISIBLE_DEVICES for MIG compatibility
-# MIG slices come as arbitrary IDs (like 3,4), but PyTorch expects 0,1,2,...
-# Remap BEFORE launching torchrun so all processes see the correct devices
+# Handle GPU detection and MIG compatibility
+# MIG (Multi-Instance GPU) slices don't work well with torchrun + NCCL
+# For MIG environments, use single GPU training for stability
 if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
     NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
-    echo "Original CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (${NUM_GPUS} GPUs)"
-    # Remap to 0,1,2,... - this works because CUDA driver handles the translation
-    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
-    echo "Remapped CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "Detected CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (${NUM_GPUS} device(s))"
+    
+    # Check if MIG is enabled (MIG devices cause issues with torchrun + NCCL)
+    if nvidia-smi -L 2>/dev/null | grep -q "MIG"; then
+        echo "MIG (Multi-Instance GPU) detected - using single GPU for stability"
+        echo "Note: torchrun + NCCL has known issues with MIG slices"
+        # Use only the first MIG slice
+        export CUDA_VISIBLE_DEVICES=$(echo $CUDA_VISIBLE_DEVICES | cut -d',' -f1)
+        NUM_GPUS=1
+        echo "Using single MIG slice: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    fi
 else
     NUM_GPUS=1
     echo "CUDA_VISIBLE_DEVICES not set, assuming 1 GPU"
