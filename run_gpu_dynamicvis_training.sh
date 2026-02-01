@@ -157,12 +157,12 @@ if command -v nvidia-smi &> /dev/null; then
     nvidia-smi
 fi
 
-# Detect number of GPUs and remap CUDA_VISIBLE_DEVICES
+# Detect number of GPUs from CUDA_VISIBLE_DEVICES
+# DO NOT remap - PyTorch handles the mapping automatically
+# SLURM sets CUDA_VISIBLE_DEVICES to physical IDs, PyTorch sees them as 0,1,2,...
 if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
     NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
-    # Remap to 0,1,2,... for PyTorch
-    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((NUM_GPUS-1)))
-    echo "Detected $NUM_GPUS GPUs, remapped CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+    echo "Detected $NUM_GPUS GPUs (CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES)"
 else
     NUM_GPUS=1
     echo "CUDA_VISIBLE_DEVICES not set, assuming 1 GPU"
