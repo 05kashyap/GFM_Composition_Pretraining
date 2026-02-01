@@ -22,7 +22,7 @@ fi
 CONFIG="configs_dynamicvis/fmow_classification/dynamicvis_b_fmow_s3.py"
 WORK_DIR="outputs/fmow_dynamicvis_b_s3"
 GPUS=1
-BATCH_SIZE=32
+BATCH_SIZE=128
 EPOCHS=100
 LR=1e-4
 DEBUG=false

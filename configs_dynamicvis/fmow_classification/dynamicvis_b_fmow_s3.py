@@ -26,7 +26,8 @@ default_hooks = dict(
         by_epoch=True,
         max_keep_ckpts=5,
         save_last=True,
-        save_best='accuracy/top1',
+        # Save best based on F1-score (same as pretrained model)
+        save_best='single-label/f1-score',
         rule='greater'
     ),
     sampler_seed=dict(type='DistSamplerSeedHook'),
@@ -187,10 +188,17 @@ val_dataloader = dict(
 test_dataloader = val_dataloader
 
 # ==================== Evaluators ====================
-val_evaluator = dict(
-    type='Accuracy',
-    topk=(1, 5),
-)
+# Use multiple metrics to match pretrained model evaluation
+# This reports: accuracy (top1/top5), precision, recall, f1-score
+val_evaluator = [
+    dict(type='Accuracy', topk=(1, 5)),
+    dict(
+        type='SingleLabelMetric',
+        items=('precision', 'recall', 'f1-score'),
+        average='macro',
+        num_classes=num_classes,
+    ),
+]
 test_evaluator = val_evaluator
 
 # ==================== Validation/Test Configuration ====================
