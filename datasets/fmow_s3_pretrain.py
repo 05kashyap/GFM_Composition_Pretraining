@@ -266,10 +266,10 @@ class FMoWS3PretrainDataset(BaseDataset):
         self.enable_prefetch = enable_prefetch
         self.prefetch_size = prefetch_size
         self.num_prefetch_workers = num_prefetch_workers
-        self.data_root = Path(data_root) if data_root else None
+        self.data_root = str(data_root) if data_root else None  # Keep as string for flexibility
         
         # Check if using local data
-        if self.data_root and self.data_root.exists():
+        if self.data_root and Path(self.data_root).exists():
             print(f"Using local data from: {self.data_root}")
             self.use_local = True
         else:
@@ -341,8 +341,10 @@ class FMoWS3PretrainDataset(BaseDataset):
                 # Read from local disk
                 # img_key format: Hosted-Datasets/fmow/fmow-rgb/train/airport/...
                 # We need: {data_root}/train/airport/...
-                local_img_path = self.data_root / img_key.replace(f'{self.s3_prefix}/', '')
-                local_json_path = self.data_root / json_key.replace(f'{self.s3_prefix}/', '')
+                relative_img = img_key.replace(f'{self.s3_prefix}/', '')
+                relative_json = json_key.replace(f'{self.s3_prefix}/', '')
+                local_img_path = Path(self.data_root) / relative_img
+                local_json_path = Path(self.data_root) / relative_json
                 
                 with open(local_img_path, 'rb') as f:
                     img_bytes = f.read()
