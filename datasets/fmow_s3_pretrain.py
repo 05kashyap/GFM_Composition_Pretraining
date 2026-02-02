@@ -337,14 +337,32 @@ class FMoWS3PretrainDataset(BaseDataset):
         json_key = sample_info['json_path']
         
         try:
-            if self.use_local:
+            # Check if we should use local data (re-check in case data_root was set after init)
+            use_local = self.use_local
+            data_root = self.data_root
+            
+            # If data_root is set but use_local wasn't enabled in init, check again
+            if data_root and not use_local:
+                data_root_path = Path(data_root).resolve()
+                if data_root_path.exists():
+                    use_local = True
+                    self.use_local = True  # Update for future calls
+                    print(f"Late-binding local data from: {data_root_path}")
+            
+            if use_local and data_root:
                 # Read from local disk
                 # img_key format: Hosted-Datasets/fmow/fmow-rgb/train/airport/...
                 # We need: {data_root}/train/airport/...
                 relative_img = img_key.replace(f'{self.s3_prefix}/', '')
                 relative_json = json_key.replace(f'{self.s3_prefix}/', '')
-                local_img_path = Path(self.data_root) / relative_img
-                local_json_path = Path(self.data_root) / relative_json
+                
+                # Use absolute path to avoid working directory issues
+                data_root_path = Path(data_root).resolve()
+                local_img_path = data_root_path / relative_img
+                local_json_path = data_root_path / relative_json
+                
+                if not local_img_path.exists():
+                    raise FileNotFoundError(f"Local file not found: {local_img_path}")
                 
                 with open(local_img_path, 'rb') as f:
                     img_bytes = f.read()
@@ -352,6 +370,10 @@ class FMoWS3PretrainDataset(BaseDataset):
                     json_data = json.load(f)
             else:
                 # Fetch from S3
+                if self.s3_client is None:
+                    use_credentials = bool(os.getenv("AWS_ACCESS_KEY_ID"))
+                    self.s3_client = create_optimized_s3_client(use_credentials)
+                
                 img_obj = self.s3_client.get_object(Bucket=self.bucket, Key=img_key)
                 img_bytes = img_obj['Body'].read()
                 

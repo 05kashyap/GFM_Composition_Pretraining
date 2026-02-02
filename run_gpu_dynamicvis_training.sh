@@ -98,7 +98,7 @@ RESUME=""
 NO_WANDB=""
 DATA_ROOT=""           # Local data directory (if pre-downloaded)
 DOWNLOAD_DATA=false    # Whether to download data before training
-DATA_DIR="./data/fmow" # Default download location
+DATA_DIR="$(pwd)/data/fmow" # Default download location (absolute path)
 
 # Add SLURM job ID to work dir if running under SLURM
 if [ -n "$SLURM_JOB_ID" ]; then

@@ -201,10 +201,12 @@ def merge_args(cfg, args):
     
     # Use local data directory (for pre-downloaded data)
     if args.data_root:
-        cfg.train_dataloader.dataset.data_root = args.data_root
+        # Convert to absolute path to avoid working directory issues
+        data_root_abs = os.path.abspath(args.data_root)
+        cfg.train_dataloader.dataset.data_root = data_root_abs
         if cfg.get('val_dataloader'):
-            cfg.val_dataloader.dataset.data_root = args.data_root
-        print(f"Using local data from: {args.data_root}")
+            cfg.val_dataloader.dataset.data_root = data_root_abs
+        print(f"Using local data from: {data_root_abs}")
     
     # Merge cfg-options
     if args.cfg_options is not None:
