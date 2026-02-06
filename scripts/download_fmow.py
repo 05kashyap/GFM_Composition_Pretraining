@@ -128,6 +128,7 @@ def download_dataset(
     use_msrgb: bool = True,
     num_workers: int = 32,
     max_files: Optional[int] = None,
+    fraction: Optional[float] = None,
 ):
     """Download the fMoW dataset."""
     bucket = "spacenet-dataset"
@@ -138,6 +139,8 @@ def download_dataset(
     print(f"Splits: {splits}")
     print(f"Image type: {'msrgb (~35GB)' if use_msrgb else 'rgb (~350GB)'}")
     print(f"Workers: {num_workers}")
+    if fraction:
+        print(f"Downloading: {fraction * 100:.1f}% of dataset (stratified per class)")
     print()
     
     # Create S3 client
@@ -158,6 +161,39 @@ def download_dataset(
     
     # Remove duplicates and sort
     files_to_download = sorted(set(files_to_download))
+    
+    # Apply stratified sampling per class (before max_files)
+    if fraction:
+        import random
+        from collections import defaultdict
+        random.seed(42)  # Reproducible sampling
+        
+        # Group images by class (class is the second part of the path: split/class/...)
+        image_files = [f for f in files_to_download if f.endswith('.jpg')]
+        class_to_images = defaultdict(list)
+        
+        for img_path in image_files:
+            parts = img_path.split('/')
+            if len(parts) >= 2:
+                class_name = parts[1]  # e.g., train/airport/... -> airport
+                class_to_images[class_name].append(img_path)
+        
+        # Sample fraction from each class
+        sampled_images = []
+        print(f"\nStratified sampling ({fraction * 100:.1f}% per class):")
+        print(f"  Found {len(class_to_images)} classes")
+        
+        for class_name in sorted(class_to_images.keys()):
+            class_images = class_to_images[class_name]
+            num_to_keep = max(1, int(len(class_images) * fraction))
+            sampled = random.sample(class_images, num_to_keep)
+            sampled_images.extend(sampled)
+            print(f"    {class_name}: {num_to_keep}/{len(class_images)} images")
+        
+        image_files = sorted(sampled_images)
+        json_files = [f.replace('.jpg', '.json') for f in image_files]
+        files_to_download = image_files + json_files
+        print(f"\n  Total sampled: {len(image_files)} images across {len(class_to_images)} classes")
     
     if max_files:
         # Take equal parts images and jsons
@@ -270,6 +306,11 @@ def main():
         type=int,
         help='Limit number of files to download (for testing)'
     )
+    parser.add_argument(
+        '--fraction',
+        type=float,
+        help='Download only this fraction of the dataset per class (e.g., 0.1 for 10%%). Uses stratified sampling to ensure equal representation across all classes.'
+    )
     
     args = parser.parse_args()
     
@@ -285,6 +326,7 @@ def main():
         use_msrgb=not args.use_rgb,
         num_workers=args.workers,
         max_files=args.max_files,
+        fraction=args.fraction,
     )
 
 

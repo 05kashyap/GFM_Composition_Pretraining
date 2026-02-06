@@ -218,10 +218,10 @@ train_dataloader = dict(
         s3_prefix=s3_prefix,
         split='train',
         pipeline=train_pipeline,
-        use_msrgb=True,  # Use smaller msrgb images
+        use_msrgb=False,  # Use full rgb images (~350GB vs ~35GB msrgb)
         enable_prefetch=True,
-        prefetch_size=1024,
-        num_prefetch_workers=16,
+        prefetch_size=512,  # Reduced for larger images
+        num_prefetch_workers=8,  # Reduced for larger images
     ),
 )
 
@@ -238,10 +238,10 @@ val_dataloader = dict(
         s3_prefix=s3_prefix,
         split='val',
         pipeline=test_pipeline,
-        use_msrgb=True,
+        use_msrgb=False,  # Use full rgb images
         enable_prefetch=True,
-        prefetch_size=512,
-        num_prefetch_workers=8,
+        prefetch_size=256,  # Reduced for larger images
+        num_prefetch_workers=4,  # Reduced for larger images
     ),
 )
 

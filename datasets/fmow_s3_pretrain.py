@@ -266,15 +266,17 @@ class FMoWS3PretrainDataset(BaseDataset):
         self.enable_prefetch = enable_prefetch
         self.prefetch_size = prefetch_size
         self.num_prefetch_workers = num_prefetch_workers
-        self.data_root = str(data_root) if data_root else None  # Keep as string for flexibility
+        
+        # Store data_root in a separate variable to avoid conflict with BaseDataset.data_root
+        self._local_data_root = str(data_root) if data_root else None
         
         # Check if using local data
-        if self.data_root and Path(self.data_root).exists():
-            print(f"Using local data from: {self.data_root}")
+        if self._local_data_root and Path(self._local_data_root).exists():
+            print(f"Using local data from: {self._local_data_root}")
             self.use_local = True
         else:
-            if self.data_root:
-                print(f"WARNING: data_root {self.data_root} does not exist, falling back to S3")
+            if self._local_data_root:
+                print(f"WARNING: data_root {self._local_data_root} does not exist, falling back to S3")
             self.use_local = False
         
         # Category mapping
@@ -339,7 +341,7 @@ class FMoWS3PretrainDataset(BaseDataset):
         try:
             # Check if we should use local data (re-check in case data_root was set after init)
             use_local = self.use_local
-            data_root = self.data_root
+            data_root = self._local_data_root
             
             # If data_root is set but use_local wasn't enabled in init, check again
             if data_root and not use_local:
@@ -408,7 +410,60 @@ class FMoWS3PretrainDataset(BaseDataset):
             return None
     
     def load_data_list(self) -> List[dict]:
-        """Load the list of samples from S3."""
+        """Load the list of samples from local disk or S3."""
+        
+        # If using local data, scan the local directory instead of using S3 manifest
+        if self.use_local and self._local_data_root:
+            return self._load_local_data_list()
+        
+        # Otherwise, use S3 manifest
+        return self._load_s3_data_list()
+    
+    def _load_local_data_list(self) -> List[dict]:
+        """Load the list of samples by scanning local directory."""
+        suffix = '_msrgb.jpg' if self.use_msrgb else '_rgb.jpg'
+        data_root = Path(self._local_data_root)
+        split_dir = data_root / self.split
+        
+        print(f"Scanning local directory for '{self.split}' split: {split_dir}")
+        print(f"Looking for files ending with: {suffix}")
+        
+        if not split_dir.exists():
+            print(f"WARNING: Split directory {split_dir} does not exist!")
+            return []
+        
+        data_list = []
+        
+        # Walk through the split directory to find all images
+        for img_path in tqdm(list(split_dir.rglob(f'*{suffix}')), desc=f"Scanning {self.split}"):
+            # Build the relative path format that matches S3 structure
+            relative_path = img_path.relative_to(data_root)
+            json_path = img_path.with_suffix('.json')
+            
+            # Skip if corresponding JSON doesn't exist
+            if not json_path.exists():
+                continue
+            
+            # Store paths in S3 format for compatibility with _fetch_sample
+            s3_img_path = f'{self.s3_prefix}/{relative_path}'
+            s3_json_path = s3_img_path.replace('.jpg', '.json')
+            
+            data_list.append({
+                'img_path': s3_img_path,
+                'json_path': s3_json_path,
+            })
+        
+        if self.shuffle_samples:
+            random.shuffle(data_list)
+        
+        if self.max_samples:
+            data_list = data_list[:self.max_samples]
+        
+        print(f"Found {len(data_list)} local samples for '{self.split}' split")
+        return data_list
+    
+    def _load_s3_data_list(self) -> List[dict]:
+        """Load the list of samples from S3 manifest."""
         cache_file = Path(f'data/fmow_manifest_{self.split}.json')
         
         # Try to load from cache
@@ -431,6 +486,10 @@ class FMoWS3PretrainDataset(BaseDataset):
         
         if not local_manifest.exists():
             print(f"Downloading manifest from s3://{self.bucket}/{manifest_key}")
+            # Create S3 client if needed (even for local mode, we need manifest)
+            if self.s3_client is None:
+                use_credentials = bool(os.getenv("AWS_ACCESS_KEY_ID"))
+                self.s3_client = create_optimized_s3_client(use_credentials)
             self.s3_client.download_file(self.bucket, manifest_key, str(local_manifest))
         
         # Parse manifest

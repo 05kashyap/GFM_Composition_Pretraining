@@ -186,6 +186,36 @@ def merge_args(cfg, args):
                 b for b in cfg.visualizer.vis_backends 
                 if b.get('type') != 'WandbVisBackend'
             ]
+    else:
+        # Update WandB config with all hyperparameters
+        wandb_config = {
+            'batch_size': cfg.train_dataloader.batch_size,
+            'epochs': cfg.train_cfg.max_epochs,
+            'learning_rate': cfg.optim_wrapper.optimizer.lr,
+            'optimizer': cfg.optim_wrapper.optimizer.type,
+            'weight_decay': cfg.optim_wrapper.optimizer.get('weight_decay', 0),
+            'img_size': cfg.img_size,
+            'num_classes': cfg.num_classes,
+            'model_arch': cfg.model.backbone.get('arch', 'unknown'),
+            'use_msrgb': cfg.train_dataloader.dataset.get('use_msrgb', True),
+            'data_root': cfg.train_dataloader.dataset.get('data_root', 'S3'),
+            'val_interval': cfg.train_cfg.get('val_interval', 1),
+            'num_workers': cfg.train_dataloader.get('num_workers', 0),
+            'amp_enabled': 'Amp' in cfg.optim_wrapper.get('type', ''),
+        }
+        
+        # Update wandb init_kwargs in vis_backends
+        for backend in cfg.get('vis_backends', []):
+            if backend.get('type') == 'WandbVisBackend':
+                backend['init_kwargs']['config'] = wandb_config
+                backend['init_kwargs']['allow_val_change'] = True
+        
+        # Also update in visualizer.vis_backends
+        if 'visualizer' in cfg and 'vis_backends' in cfg.visualizer:
+            for backend in cfg.visualizer.vis_backends:
+                if backend.get('type') == 'WandbVisBackend':
+                    backend['init_kwargs']['config'] = wandb_config
+                    backend['init_kwargs']['allow_val_change'] = True
     
     # Limit samples for debugging
     if args.max_samples is not None:

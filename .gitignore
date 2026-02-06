@@ -1,3 +1,6 @@
+# Repository-specific gitignore rules
+data/fmow/
+slurm*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1g.24gb:0
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 ##SBATCH --time=00:10:00
 
 # =============================================================================
@@ -19,6 +19,7 @@
 # Usage:
 #   sbatch run_gpu_dynamicvis_training.sh                     # Default (stream from S3)
 #   sbatch run_gpu_dynamicvis_training.sh --download-data     # Download then train
+#   sbatch run_gpu_dynamicvis_training.sh --download-data --data-fraction 0.1  # Download 10% per class
 #   sbatch run_gpu_dynamicvis_training.sh --data-root /path   # Use existing local data
 #   sbatch run_gpu_dynamicvis_training.sh --epochs 50         # Custom epochs
 #   sbatch run_gpu_dynamicvis_training.sh --no-wandb          # Disable wandb
@@ -91,14 +92,15 @@ fi
 # Default values - Using pretrain config with bounding boxes (like official weights)
 CONFIG="configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py"
 WORK_DIR="outputs/fmow_dynamicvis_b_s3_pretrain"
-BATCH_SIZE=16  # Smaller batch due to larger images + FPN
-EPOCHS=200     # Official training uses 200 epochs
+BATCH_SIZE=32   # Reduced for full rgb images (larger than msrgb)
+EPOCHS=2     # Official training uses 200 epochs
 LR=4e-4        # Official learning rate
 RESUME=""
 NO_WANDB=""
 DATA_ROOT=""           # Local data directory (if pre-downloaded)
 DOWNLOAD_DATA=false    # Whether to download data before training
 DATA_DIR="$(pwd)/data/fmow" # Default download location (absolute path)
+DATA_FRACTION=""       # Fraction of data to download per class (empty = all, e.g., 0.1 for 10%)
 
 # Add SLURM job ID to work dir if running under SLURM
 if [ -n "$SLURM_JOB_ID" ]; then
@@ -153,6 +155,10 @@ while [[ $# -gt 0 ]]; do
             DATA_DIR="$2"
             shift 2
             ;;
+        --data-fraction)
+            DATA_FRACTION="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
@@ -180,14 +186,20 @@ if [ "$DOWNLOAD_DATA" = true ]; then
     echo "Downloading fMoW dataset..."
     echo "=============================================="
     echo "Target directory: $DATA_DIR"
-    echo "This will download ~35GB of msrgb images"
+    echo "This will download ~350GB of rgb images"
     echo ""
     
     # Run the download script (non-interactive for SLURM)
+    # Using --use-rgb for full resolution images
+    FRACTION_ARG=""
+    if [ -n "$DATA_FRACTION" ]; then
+        FRACTION_ARG="--fraction $DATA_FRACTION"
+    fi
     python scripts/download_fmow.py \
         --output-dir "$DATA_DIR" \
         --split all \
-        --workers 32 <<< "y"
+        --workers 32 \
+        --use-rgb $FRACTION_ARG <<< "y"
     
     if [ $? -eq 0 ]; then
         echo "Download completed successfully!"
