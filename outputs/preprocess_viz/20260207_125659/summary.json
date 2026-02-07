@@ -1,0 +1,32 @@
+{
+  "run_id": "20260207_125659",
+  "data_root": "data/fmow",
+  "split": "val",
+  "size_stats_n": 50,
+  "cluster_num_images": 5,
+  "viz_num_images": 2,
+  "max_edge": 1024,
+  "pad_size": 1024,
+  "large_size": 256,
+  "large_stride": 256,
+  "small_size": 64,
+  "small_stride": 64,
+  "embedder": "torchvision:resnet18",
+  "device": "cuda",
+  "embedding_dim": 512,
+  "k": 10,
+  "kmeans_iters": 1,
+  "small_patches_per_image": 0,
+  "cluster_sizes": [
+    55,
+    81,
+    104,
+    54,
+    12,
+    244,
+    233,
+    384,
+    113,
+    0
+  ]
+}

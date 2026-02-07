@@ -1,6 +1,11 @@
 # Repository-specific gitignore rules
 data/fmow/
 slurm*
+
+# Local model weights (keep out of git)
+weights/
+*.pth
+*.pt
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -24,6 +24,8 @@
 #   sbatch run_gpu_dynamicvis_training.sh --epochs 50         # Custom epochs
 #   sbatch run_gpu_dynamicvis_training.sh --no-wandb          # Disable wandb
 #   sbatch run_gpu_dynamicvis_training.sh --resume            # Resume training
+#   sbatch run_gpu_dynamicvis_training.sh --num-gpus 2         # DDP on 2 MIG slices
+#   sbatch run_gpu_dynamicvis_training.sh --num-gpus 1         # Single MIG slice (default)
 # =============================================================================
 
 echo "=============================================="
@@ -81,6 +83,47 @@ fi
 export PYTHONPATH="$(pwd):$(pwd)/architectures/DynamicVis:$PYTHONPATH"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
+# =============================================================================
+# MIG GPU Configuration for DDP
+# =============================================================================
+# All available MIG slices, organized by physical GPU.
+# GPU 0 (PCIe bus 26:00.0) and GPU 1 (PCIe bus 89:00.0)
+# Use: nvidia-smi -L to discover available MIG UUIDs on your node
+#
+# NCCL constraint: only 1 MIG slice per physical GPU (same bus ID = "Duplicate GPU").
+#   → --num-gpus 1-2: uses NCCL backend (fast, 1 slice per physical GPU)
+#   → --num-gpus 3-8: uses gloo backend (allows multiple slices per GPU)
+#
+# Slices are listed in round-robin order (GPU0, GPU1, GPU0, GPU1, ...)
+# so the first N slices always maximize cross-GPU spread.
+MIG_GPU0=(
+    "MIG-418e4605-20dd-5066-8ba8-ecaa0dcd9e2b"  # GPU0 Device 1
+    "MIG-a95be726-a3ac-5445-8427-a9fba33402a4"  # GPU0 Device 0
+    "MIG-093f7e1b-6f21-5e12-bc9e-435e7f019600"  # GPU0 Device 2
+    "MIG-d92daec9-5afd-5a16-adac-861b9216d4f9"  # GPU0 Device 3
+)
+MIG_GPU1=(
+    "MIG-cc67418b-8d94-51c4-88d2-ec45ff0e92c0"  # GPU1 Device 0
+    "MIG-b1ebaa2d-6256-57d7-a497-6c7fc5dd254b"  # GPU1 Device 1
+    "MIG-283697f2-709b-5149-bf8e-30a0abe75dc4"  # GPU1 Device 2
+    "MIG-83d74367-8c40-525a-9aab-fb561a0a3daa"  # GPU1 Device 3
+)
+
+# Build round-robin interleaved list: GPU0[0], GPU1[0], GPU0[1], GPU1[1], ...
+MIG_UUIDS=()
+for ((i=0; i<${#MIG_GPU0[@]}; i++)); do
+    MIG_UUIDS+=("${MIG_GPU0[$i]}")
+    MIG_UUIDS+=("${MIG_GPU1[$i]}")
+done
+echo "Available MIG slices: ${#MIG_UUIDS[@]} (${#MIG_GPU0[@]} per GPU x 2 GPUs)"
+
+# NCCL settings for MIG (P2P not supported between MIG instances)
+export NCCL_P2P_DISABLE=1
+export NCCL_SHM_DISABLE=0
+export NCCL_IB_DISABLE=1
+# Reduce NCCL verbosity (set to INFO for debugging)
+export NCCL_DEBUG=WARN
+
 # Load environment variables (AWS credentials, wandb key)
 if [ -f .env ]; then
     set -a
@@ -101,6 +144,8 @@ DATA_ROOT=""           # Local data directory (if pre-downloaded)
 DOWNLOAD_DATA=false    # Whether to download data before training
 DATA_DIR="$(pwd)/data/fmow" # Default download location (absolute path)
 DATA_FRACTION=""       # Fraction of data to download per class (empty = all, e.g., 0.1 for 10%)
+NUM_GPUS=2             # Number of MIG slices to use for DDP (1 = single GPU, 2+ = DDP)
+DIST_BACKEND="auto"    # auto=nccl for <=2 GPUs, gloo for >2. Or force: nccl, gloo
 
 # Add SLURM job ID to work dir if running under SLURM
 if [ -n "$SLURM_JOB_ID" ]; then
@@ -159,11 +204,69 @@ while [[ $# -gt 0 ]]; do
             DATA_FRACTION="$2"
             shift 2
             ;;
+        --num-gpus)
+            NUM_GPUS="$2"
+            shift 2
+            ;;
+        --dist-backend)
+            DIST_BACKEND="$2"
+            shift 2
+            ;;
         *)
             shift
             ;;
     esac
 done
+
+# =============================================================================
+# Resolve distributed backend and validate NUM_GPUS
+# =============================================================================
+# Cap NUM_GPUS to available slices
+if [ "$NUM_GPUS" -gt "${#MIG_UUIDS[@]}" ]; then
+    echo "WARNING: Requested $NUM_GPUS GPUs but only ${#MIG_UUIDS[@]} MIG slices available. Capping."
+    NUM_GPUS=${#MIG_UUIDS[@]}
+fi
+
+# Auto-select backend:
+#   <=2 GPUs: nccl (1 slice per physical GPU, fast GPU-native collectives)
+#   >2 GPUs:  gloo (CPU-based collectives, allows multiple slices per physical GPU)
+if [ "$DIST_BACKEND" = "auto" ]; then
+    if [ "$NUM_GPUS" -le 2 ]; then
+        DIST_BACKEND="nccl"
+    else
+        DIST_BACKEND="gloo"
+    fi
+fi
+
+if [ "$DIST_BACKEND" = "nccl" ] && [ "$NUM_GPUS" -gt 2 ]; then
+    echo "WARNING: NCCL with >2 MIG slices will fail (duplicate GPU on same PCIe bus)."
+    echo "         Switching to gloo backend automatically."
+    DIST_BACKEND="gloo"
+fi
+
+echo "Distributed backend: $DIST_BACKEND"
+
+# =============================================================================
+# Set CUDA_VISIBLE_DEVICES based on NUM_GPUS
+# =============================================================================
+if [ "$NUM_GPUS" -gt 1 ] 2>/dev/null; then
+    # Build comma-separated list of MIG UUIDs
+    CUDA_DEVICES=""
+    for ((i=0; i<NUM_GPUS && i<${#MIG_UUIDS[@]}; i++)); do
+        if [ -n "$CUDA_DEVICES" ]; then
+            CUDA_DEVICES="${CUDA_DEVICES},${MIG_UUIDS[$i]}"
+        else
+            CUDA_DEVICES="${MIG_UUIDS[$i]}"
+        fi
+    done
+    export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
+    echo "DDP Mode: Using $NUM_GPUS MIG slices ($DIST_BACKEND backend)"
+    echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+elif [ "$NUM_GPUS" -eq 1 ] 2>/dev/null; then
+    export CUDA_VISIBLE_DEVICES="${MIG_UUIDS[0]}"
+    echo "Single GPU Mode: Using 1 MIG slice"
+    echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+fi
 
 # Print configuration
 echo ""
@@ -176,6 +279,9 @@ echo "  Learning rate: $LR"
 echo "  WandB: $([ -z "$NO_WANDB" ] && echo "Enabled" || echo "Disabled")"
 echo "  Data source: $([ -n "$DATA_ROOT" ] && echo "Local ($DATA_ROOT)" || echo "S3 streaming")"
 echo "  Download data: $DOWNLOAD_DATA"
+echo "  Num GPUs (MIG slices): $NUM_GPUS"
+echo "  Dist backend: $DIST_BACKEND"
+echo "  Launcher: $([ "$NUM_GPUS" -gt 1 ] && echo "torchrun DDP" || echo "single process")"
 echo ""
 
 # =============================================================================
@@ -232,12 +338,29 @@ echo "Starting training..."
 echo ""
 
 # Run training - using pretrain script for bbox-based training
-python train_dynamicvis_pretrain.py $CONFIG \
-    --work-dir $WORK_DIR \
-    --batch-size $BATCH_SIZE \
-    --epochs $EPOCHS \
-    --lr $LR \
-    $RESUME $NO_WANDB $DATA_ROOT_ARG
+if [ "$NUM_GPUS" -gt 1 ] 2>/dev/null; then
+    # Multi-GPU DDP training via torchrun
+    echo "Launching DDP with torchrun (nproc_per_node=$NUM_GPUS)..."
+    torchrun \
+        --nproc_per_node=$NUM_GPUS \
+        --master_port=$((29500 + RANDOM % 1000)) \
+        train_dynamicvis_pretrain.py $CONFIG \
+        --work-dir $WORK_DIR \
+        --batch-size $BATCH_SIZE \
+        --epochs $EPOCHS \
+        --lr $LR \
+        --launcher pytorch \
+        --dist-backend $DIST_BACKEND \
+        $RESUME $NO_WANDB $DATA_ROOT_ARG
+else
+    # Single GPU training
+    python train_dynamicvis_pretrain.py $CONFIG \
+        --work-dir $WORK_DIR \
+        --batch-size $BATCH_SIZE \
+        --epochs $EPOCHS \
+        --lr $LR \
+        $RESUME $NO_WANDB $DATA_ROOT_ARG
+fi
 
 echo ""
 echo "=============================================="

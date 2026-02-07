@@ -1,0 +1,89 @@
+_wandb:
+    value:
+        cli_version: 0.24.1
+        e:
+            7n16mllycvadmldgkuicyoic976pki8s:
+                args:
+                    - configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py
+                    - --work-dir
+                    - outputs/fmow_dynamicvis_b_s3_pretrain_6526
+                    - --batch-size
+                    - "32"
+                    - --epochs
+                    - "2"
+                    - --lr
+                    - "4e-4"
+                    - --data-root
+                    - ./data/fmow
+                codePath: train_dynamicvis_pretrain.py
+                codePathLocal: train_dynamicvis_pretrain.py
+                email: aryankashyapnaveen@gmail.com
+                executable: /data/home/slb1028/work/AryanKashyapN-221AI012/miniconda3/envs/dynamicvis/bin/python
+                git:
+                    commit: 96f17d1544e5be86d2b8281fcc5500e289207b55
+                    remote: https://github.com/05kashyap/SatBae.git
+                host: gpuit
+                os: Linux-5.14.0-570.18.1.el9_6.x86_64-x86_64-with-glibc2.34
+                program: /data/home/slb1028/work/AryanKashyapN-221AI012/SatBae/train_dynamicvis_pretrain.py
+                python: CPython 3.11.14
+                root: /data/home/slb1028/work/AryanKashyapN-221AI012/SatBae/outputs/fmow_dynamicvis_b_s3_pretrain_6526/20260206_195812/vis_data
+                startedAt: "2026-02-06T14:28:14.928096Z"
+                writerId: 7n16mllycvadmldgkuicyoic976pki8s
+        m: []
+        python_version: 3.11.14
+        t:
+            "1":
+                - 1
+                - 11
+                - 37
+                - 38
+                - 41
+                - 49
+                - 51
+                - 60
+                - 82
+            "2":
+                - 1
+                - 11
+                - 37
+                - 38
+                - 41
+                - 49
+                - 51
+                - 60
+                - 82
+            "3":
+                - 13
+                - 15
+                - 16
+            "4": 3.11.14
+            "5": 0.24.1
+            "6": 4.50.0
+            "12": 0.24.1
+            "13": linux-x86_64
+amp_enabled:
+    value: true
+batch_size:
+    value: 32
+data_root:
+    value: S3
+epochs:
+    value: 2
+img_size:
+    value: 512
+learning_rate:
+    value: 0.0004
+model_arch:
+    value: b
+num_classes:
+    value: 63
+num_workers:
+    value: 4
+optimizer:
+    value: AdamW
+use_msrgb:
+    value: false
+val_interval:
+    value: 10
+weight_decay:
+    value: 0.05
