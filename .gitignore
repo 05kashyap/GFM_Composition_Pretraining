@@ -1,7 +1,8 @@
 # Repository-specific gitignore rules
 data/fmow/
 slurm*
-
+outputs
+logs
 # Local model weights (keep out of git)
 weights/
 *.pth
