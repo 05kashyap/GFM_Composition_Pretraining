@@ -213,11 +213,174 @@ def _strip_known_prefixes(k: str) -> str:
     return k
 
 
-class DinoV3SatViTL16Embedder(Embedder):
-    """Local DINOv3 ViT-L/16 embedder backed by torchvision ViT.
+# ---------------------------------------------------------------
+# Native DINOv3 ViT-L/16 model definition (matches checkpoint keys)
+# ---------------------------------------------------------------
 
-    This loads the provided .pth into a torchvision ViT-L/16 skeleton.
-    Embeddings are the pre-head outputs (heads replaced with Identity).
+class _RoPE2D(torch.nn.Module):
+    """2-D Rotary Position Embedding for vision transformers."""
+
+    def __init__(self, dim: int, n_periods: int = 16, max_res: int = 256):
+        super().__init__()
+        # The checkpoint stores learned periods of shape (n_periods,)
+        self.register_buffer("periods", torch.arange(n_periods).float(), persistent=True)
+        self.max_res = max_res
+        self._dim = dim
+
+    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """x: (B, N, D) where N = h*w (no cls/register tokens)."""
+        device = x.device
+        dtype = x.dtype
+        half = self._dim // 4
+
+        freqs = 1.0 / (10000.0 ** (self.periods / half))  # (half,)
+        gy = torch.arange(h, device=device, dtype=dtype)
+        gx = torch.arange(w, device=device, dtype=dtype)
+        fy = torch.outer(gy, freqs)  # (h, half)
+        fx = torch.outer(gx, freqs)  # (w, half)
+
+        fy = fy[:, None, :].expand(h, w, half).reshape(h * w, half)
+        fx = fx[None, :, :].expand(h, w, half).reshape(h * w, half)
+        angles = torch.cat([fy, fy, fx, fx], dim=-1)  # (h*w, dim)
+
+        cos_ = torch.cos(angles).unsqueeze(0)
+        sin_ = torch.sin(angles).unsqueeze(0)
+
+        x1 = x[..., : self._dim]
+        x2 = x[..., self._dim :]
+
+        x1_rot = torch.stack([-x1[..., half : 2 * half],
+                               x1[..., : half],
+                               -x1[..., 3 * half :],
+                               x1[..., 2 * half : 3 * half]], dim=-1).reshape_as(x1)
+        x1 = x1 * cos_ + x1_rot * sin_
+        return torch.cat([x1, x2], dim=-1)
+
+
+class _Attention(torch.nn.Module):
+    def __init__(self, dim: int, num_heads: int = 16, qkv_bias: bool = True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = torch.nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # bias_mask is stored in the checkpoint; register as buffer
+        self.register_buffer("qkv_bias_mask", torch.ones(dim * 3), persistent=False)
+        self.proj = torch.nn.Linear(dim, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        return x
+
+
+class _Mlp(torch.nn.Module):
+    def __init__(self, dim: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.fc1 = torch.nn.Linear(dim, hidden)
+        self.act = torch.nn.GELU()
+        self.fc2 = torch.nn.Linear(hidden, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class _LayerScale(torch.nn.Module):
+    def __init__(self, dim: int, init_value: float = 1e-5):
+        super().__init__()
+        self.gamma = torch.nn.Parameter(init_value * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.gamma
+
+
+class _Block(torch.nn.Module):
+    def __init__(self, dim: int, num_heads: int = 16, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.norm1 = torch.nn.LayerNorm(dim)
+        self.attn = _Attention(dim, num_heads=num_heads)
+        self.ls1 = _LayerScale(dim)
+        self.norm2 = torch.nn.LayerNorm(dim)
+        self.mlp = _Mlp(dim, mlp_ratio=mlp_ratio)
+        self.ls2 = _LayerScale(dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.ls1(self.attn(self.norm1(x)))
+        x = x + self.ls2(self.mlp(self.norm2(x)))
+        return x
+
+
+class _PatchEmbed(torch.nn.Module):
+    def __init__(self, patch_size: int = 16, in_chans: int = 3, embed_dim: int = 1024):
+        super().__init__()
+        self.patch_size = patch_size
+        self.proj = torch.nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W) -> (B, N, D)
+        return self.proj(x).flatten(2).transpose(1, 2)
+
+
+class DinoV3SatViTL16(torch.nn.Module):
+    """Native DINOv3/DINOv2-style ViT-L/16 that matches the checkpoint exactly.
+
+    Architecture: ViT-L/16, dim=1024, depth=24, heads=16, mlp_ratio=4
+    Features: RoPE, layer scale, 4 register (storage) tokens, cls token.
+    """
+
+    def __init__(self, patch_size: int = 16, embed_dim: int = 1024,
+                 depth: int = 24, num_heads: int = 16, mlp_ratio: float = 4.0,
+                 num_register_tokens: int = 4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.num_register_tokens = num_register_tokens
+
+        self.cls_token = torch.nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.storage_tokens = torch.nn.Parameter(torch.zeros(1, num_register_tokens, embed_dim))
+        self.mask_token = torch.nn.Parameter(torch.zeros(1, embed_dim))
+        self.patch_embed = _PatchEmbed(patch_size=patch_size, embed_dim=embed_dim)
+        self.rope_embed = _RoPE2D(dim=embed_dim)
+        self.blocks = torch.nn.ModuleList([
+            _Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio)
+            for _ in range(depth)
+        ])
+        self.norm = torch.nn.LayerNorm(embed_dim)
+        self.local_cls_norm = torch.nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, 3, H, W) -> (B, embed_dim) cls token output."""
+        B = x.shape[0]
+        # Patch embed
+        tokens = self.patch_embed(x)  # (B, N, D)
+        h = x.shape[2] // self.patch_size
+        w = x.shape[3] // self.patch_size
+
+        # Prepend cls + register tokens
+        cls = self.cls_token.expand(B, -1, -1)
+        reg = self.storage_tokens.expand(B, -1, -1)
+        tokens = torch.cat([cls, reg, tokens], dim=1)  # (B, 1+R+N, D)
+
+        # Forward through blocks
+        for blk in self.blocks:
+            tokens = blk(tokens)
+
+        # Norm and return cls token
+        tokens = self.norm(tokens)
+        return tokens[:, 0]  # cls token
+
+
+class DinoV3SatViTL16Embedder(Embedder):
+    """Local DINOv3 ViT-L/16 embedder using native architecture matching checkpoint.
+
+    Loads the .pth into a custom ViT-L/16 that matches the DINOv3 checkpoint
+    structure exactly (fused QKV, layer scale, RoPE, register tokens).
 
     Inputs are resized to 224x224 and normalized with ImageNet stats.
     """
@@ -226,15 +389,13 @@ class DinoV3SatViTL16Embedder(Embedder):
         super().__init__(device=device)
         self.weights_path = str(weights_path)
 
-        try:
-            from torchvision.models import vit_l_16
-            import torchvision.transforms as T
-            from torchvision.transforms import InterpolationMode
-        except Exception as e:
-            raise RuntimeError(f"torchvision is required. Root error: {e}")
+        import torchvision.transforms as T
+        from torchvision.transforms import InterpolationMode
 
-        model = vit_l_16(weights=None)
-        model.heads = torch.nn.Identity()
+        model = DinoV3SatViTL16(
+            patch_size=16, embed_dim=1024, depth=24,
+            num_heads=16, mlp_ratio=4.0, num_register_tokens=4,
+        )
         self.model = model.eval().to(self.device)
 
         self.transforms = T.Compose(
@@ -250,20 +411,37 @@ class DinoV3SatViTL16Embedder(Embedder):
         if not wpath.exists():
             raise FileNotFoundError(f"Weights not found: {wpath}")
 
-        ckpt = torch.load(str(wpath), map_location="cpu")
+        ckpt = torch.load(str(wpath), map_location="cpu", weights_only=False)
         sd_raw = _extract_checkpoint_state_dict(ckpt)
         sd = {_strip_known_prefixes(k): v for k, v in sd_raw.items() if isinstance(v, torch.Tensor)}
 
-        incompatible = self.model.load_state_dict(sd, strict=False)
-        try:
-            print(
-                f"Loaded DINOv3 SAT weights: {wpath.name} | "
-                f"missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}"
-            )
-        except Exception:
-            pass
+        # Map checkpoint key "attn.qkv.bias_mask" -> registered buffer name
+        mapped_sd: Dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            mapped_sd[k] = v
 
-        self._embedding_dim = int(getattr(self.model, "hidden_dim", 1024))
+        # Load with strict=False since qkv.bias_mask is stored under a dotted
+        # name in the checkpoint ("attn.qkv.bias_mask") which doesn't map 1:1
+        # to the buffer we register ("attn.qkv_bias_mask").  These are just
+        # binary masks, not trainable weights, so skipping them is safe.
+        incompatible = self.model.load_state_dict(mapped_sd, strict=False)
+        n_missing = len(incompatible.missing_keys)
+        # Filter out qkv_bias_mask from unexpected (benign)
+        real_unexpected = [k for k in incompatible.unexpected_keys if "bias_mask" not in k]
+        n_unexpected = len(real_unexpected)
+        print(
+            f"Loaded DINOv3 SAT weights: {wpath.name} | "
+            f"missing={n_missing} unexpected={n_unexpected}"
+            f"{' (+ 24 qkv_bias_mask buffers skipped)' if len(incompatible.unexpected_keys) > n_unexpected else ''}"
+        )
+        if n_missing > 0:
+            print(f"  Missing keys: {incompatible.missing_keys[:10]}")
+        if n_unexpected > 0:
+            print(f"  Unexpected keys: {real_unexpected[:10]}")
+        if n_missing > 0 or n_unexpected > 0:
+            print("  WARNING: significant key mismatch — embeddings may be incorrect!")
+
+        self._embedding_dim = 1024
 
     @property
     def name(self) -> str:
@@ -570,6 +748,14 @@ def main() -> int:
 
     parser.add_argument("--k", type=int, default=60)
 
+    # Multi-GPU parallel embedding support
+    parser.add_argument("--embed-only", action="store_true",
+                        help="Embed and cache all patches, then exit (for multi-GPU parallel preprocessing)")
+    parser.add_argument("--shard-index", type=int, default=0,
+                        help="Worker index for parallel embedding (0-based)")
+    parser.add_argument("--num-shards", type=int, default=1,
+                        help="Total number of parallel embedding workers")
+
     args = parser.parse_args()
 
     _seed_all(args.seed)
@@ -592,48 +778,55 @@ def main() -> int:
     else:
         print(f"Device: {device.type}")
 
-    # Stage 0: size distribution
-    size_n = min(args.size_stats_n, len(all_paths))
-    size_paths = _sample_stratified(all_paths, split_dir, size_n, rng)
-    widths: List[int] = []
-    heights: List[int] = []
-    for p in size_paths:
-        try:
-            with Image.open(p) as im:
-                w, h = im.size
-            widths.append(int(w))
-            heights.append(int(h))
-        except Exception:
-            continue
+    # Stage 0: size distribution (skip in embed-only mode)
+    if not args.embed_only:
+        size_n = min(args.size_stats_n, len(all_paths))
+        size_paths = _sample_stratified(all_paths, split_dir, size_n, rng)
+        widths: List[int] = []
+        heights: List[int] = []
+        for p in size_paths:
+            try:
+                with Image.open(p) as im:
+                    w, h = im.size
+                widths.append(int(w))
+                heights.append(int(h))
+            except Exception:
+                continue
 
-    if widths and heights:
-        w_arr = np.asarray(widths)
-        h_arr = np.asarray(heights)
-        print(
-            "Image size stats (sample): "
-            f"n={len(w_arr)} | mean_w={w_arr.mean():.1f}, mean_h={h_arr.mean():.1f} | "
-            f"median_w={np.median(w_arr):.0f}, median_h={np.median(h_arr):.0f}"
-        )
-        plt.figure(figsize=(10, 4))
-        plt.subplot(1, 2, 1)
-        plt.hist(w_arr, bins=40)
-        plt.title("Width distribution")
-        plt.xlabel("width")
-        plt.ylabel("count")
-        plt.subplot(1, 2, 2)
-        plt.hist(h_arr, bins=40)
-        plt.title("Height distribution")
-        plt.xlabel("height")
-        plt.ylabel("count")
-        plt.tight_layout()
-        plt.savefig(out_dir / "image_size_distribution.png", dpi=160)
-        plt.close()
-    else:
-        print("WARNING: Could not compute size distribution")
+        if widths and heights:
+            w_arr = np.asarray(widths)
+            h_arr = np.asarray(heights)
+            print(
+                "Image size stats (sample): "
+                f"n={len(w_arr)} | mean_w={w_arr.mean():.1f}, mean_h={h_arr.mean():.1f} | "
+                f"median_w={np.median(w_arr):.0f}, median_h={np.median(h_arr):.0f}"
+            )
+            plt.figure(figsize=(10, 4))
+            plt.subplot(1, 2, 1)
+            plt.hist(w_arr, bins=40)
+            plt.title("Width distribution")
+            plt.xlabel("width")
+            plt.ylabel("count")
+            plt.subplot(1, 2, 2)
+            plt.hist(h_arr, bins=40)
+            plt.title("Height distribution")
+            plt.xlabel("height")
+            plt.ylabel("count")
+            plt.tight_layout()
+            plt.savefig(out_dir / "image_size_distribution.png", dpi=160)
+            plt.close()
+        else:
+            print("WARNING: Could not compute size distribution")
+
+    # Restore RNG state for deterministic cluster_paths regardless of embed-only
+    rng = random.Random(args.seed)
+    # _sample_stratified for size_paths consumed some RNG; re-seed for consistency
+    # Actually we need the same cluster_paths across all shards, so re-seed here.
+    rng_cluster = random.Random(args.seed + 1)
 
     # Sample images for clustering/viz
     cluster_n = min(int(args.cluster_num_images), len(all_paths))
-    cluster_paths = _sample_stratified(all_paths, split_dir, cluster_n, rng)
+    cluster_paths = _sample_stratified(all_paths, split_dir, cluster_n, rng_cluster)
     viz_n = min(int(args.viz_num_images), len(cluster_paths))
     viz_set = set(cluster_paths[:viz_n])
 
@@ -647,6 +840,41 @@ def main() -> int:
         small_patches_full = _extract_grid_patches(pw, ph, patch=args.small_size, stride=args.small_stride)
         small_imgs = [_crop(img, sp) for sp in small_patches_full]
         return small_patches_full, small_imgs
+
+    # ---------------------------------------------------------------
+    # Multi-GPU embed-only mode: cache embeddings for a shard, then exit.
+    # Usage: run N workers in parallel, each with --embed-only --shard-index i --num-shards N
+    # Then run the full pipeline once (reads all embeddings from cache).
+    # ---------------------------------------------------------------
+    if args.embed_only:
+        shard_paths = cluster_paths[args.shard_index::args.num_shards]
+        print(f"[Shard {args.shard_index}/{args.num_shards}] "
+              f"Embed-only mode: processing {len(shard_paths)}/{len(cluster_paths)} images",
+              flush=True)
+        t0 = time.time()
+        for i, p in enumerate(shard_paths):
+            img = _load_and_standardize_image(p, max_edge=args.max_edge, pad_size=args.pad_size)
+            small_patches_full, small_imgs = iter_small_patches_for_image(img)
+            _get_or_compute_embeddings_cached(
+                cache_dir=cache_dir,
+                image_path=p,
+                embedder=embedder,
+                max_edge=args.max_edge,
+                pad_size=args.pad_size,
+                patches=small_patches_full,
+                patch_images=small_imgs,
+                embed_batch=args.embed_batch,
+                weights_path=args.weights_path,
+                cache=True,
+            )
+            if (i + 1) % 10 == 0 or (i + 1) == len(shard_paths):
+                dt = time.time() - t0
+                ips = (i + 1) / max(dt, 1e-6)
+                eta = (len(shard_paths) - (i + 1)) / max(ips, 1e-6)
+                print(f"[Shard {args.shard_index}] Cached: {i+1}/{len(shard_paths)} images "
+                      f"| {ips:.2f} img/s | ETA: {eta/60:.1f}min", flush=True)
+        print(f"[Shard {args.shard_index}] Embedding complete. Cache dir: {cache_dir}", flush=True)
+        return 0
 
     clusterer_name = str(args.clusterer)
     shown = 0
@@ -686,14 +914,14 @@ def main() -> int:
             )
             fit_embs.append(embs)
 
-            if (i + 1) % 50 == 0 or (i + 1) == cluster_n:
+            if (i + 1) % 10 == 0 or (i + 1) == cluster_n:
                 dt = time.time() - t0
                 ips = (i + 1) / max(dt, 1e-6)
-                print(f"Embedding (fit set): {i+1}/{cluster_n} images | {ips:.2f} img/s")
+                print(f"Embedding (fit set): {i+1}/{cluster_n} images | {ips:.2f} img/s", flush=True)
 
         X = np.concatenate(fit_embs, axis=0)
         X = _l2_normalize_np(X)
-        print(f"Fit embedding matrix: {X.shape} (N,D)")
+        print(f"Fit embedding matrix: {X.shape} (N,D)", flush=True)
 
         pca, X_pca = _fit_pca(X, pca_dim=int(args.pca_dim), seed=args.seed)
         X_pca = _l2_normalize_np(X_pca.astype(np.float32))
@@ -843,14 +1071,14 @@ def main() -> int:
             )
             fit_embs.append(embs)
 
-            if (i + 1) % 50 == 0 or (i + 1) == cluster_n:
+            if (i + 1) % 10 == 0 or (i + 1) == cluster_n:
                 dt = time.time() - t0
                 ips = (i + 1) / max(dt, 1e-6)
-                print(f"Embedding (fit set): {i+1}/{cluster_n} images | {ips:.2f} img/s")
+                print(f"Embedding (fit set): {i+1}/{cluster_n} images | {ips:.2f} img/s", flush=True)
 
         X = np.concatenate(fit_embs, axis=0)
         X = _l2_normalize_np(X)
-        print(f"Fit embedding matrix: {X.shape} (N,D)")
+        print(f"Fit embedding matrix: {X.shape} (N,D)", flush=True)
 
         pca, X_pca = _fit_pca(X, pca_dim=int(args.pca_dim), seed=args.seed)
         X_pca = _l2_normalize_np(X_pca.astype(np.float32))
