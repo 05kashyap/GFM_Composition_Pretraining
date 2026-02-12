@@ -58,6 +58,13 @@ VIZ_NUM_IMAGES=50
 PAD_SIZE=1024
 LARGE_SIZE=256
 SMALL_SIZE=64
+# Sliding window strides (default: 50% overlap → stride = size / 2)
+SMALL_STRIDE=32
+SMALL_STRIDE_X=""  # empty = use SMALL_STRIDE for both axes
+SMALL_STRIDE_Y=""
+LARGE_STRIDE="$LARGE_SIZE"
+LARGE_STRIDE_X=""
+LARGE_STRIDE_Y=""
 
 # HDBSCAN recipe defaults
 FIT_SMALL_PATCHES_PER_IMAGE=16  # 5000 images -> 80k fit points
@@ -91,6 +98,18 @@ while [[ $# -gt 0 ]]; do
       PCA_DIM="$2"; shift 2 ;;
     --fit-small-patches-per-image)
       FIT_SMALL_PATCHES_PER_IMAGE="$2"; shift 2 ;;
+    --small-stride)
+      SMALL_STRIDE="$2"; shift 2 ;;
+    --small-stride-x)
+      SMALL_STRIDE_X="$2"; shift 2 ;;
+    --small-stride-y)
+      SMALL_STRIDE_Y="$2"; shift 2 ;;
+    --large-stride)
+      LARGE_STRIDE="$2"; shift 2 ;;
+    --large-stride-x)
+      LARGE_STRIDE_X="$2"; shift 2 ;;
+    --large-stride-y)
+      LARGE_STRIDE_Y="$2"; shift 2 ;;
     *)
       echo "Unknown arg: $1"; shift ;;
   esac
@@ -106,6 +125,7 @@ echo "  viz_num_images: $VIZ_NUM_IMAGES"
 echo "  pad_size: $PAD_SIZE"
 echo "  large_size: $LARGE_SIZE"
 echo "  small_size: $SMALL_SIZE"
+echo "  small_stride: $SMALL_STRIDE (stride_x=${SMALL_STRIDE_X:-$SMALL_STRIDE} stride_y=${SMALL_STRIDE_Y:-$SMALL_STRIDE})"
 echo "  embedder: dinov2"
 echo "  clusterer: $CLUSTERER"
 echo "  k: $K"
@@ -115,24 +135,40 @@ echo "  hdbscan_min_cluster_size: $MIN_CLUSTER_SIZE"
 echo ""
 
 # Unbuffered output is important for continuous Slurm logs
-python -u scripts/viz_fmow_patch_embed_cluster.py \
-  --data-root "$DATA_ROOT" \
-  --split "$SPLIT" \
-  --size-stats-n "$SIZE_STATS_N" \
-  --cluster-num-images "$CLUSTER_NUM_IMAGES" \
-  --viz-num-images "$VIZ_NUM_IMAGES" \
-  --pad-size "$PAD_SIZE" \
-  --large-size "$LARGE_SIZE" --large-stride "$LARGE_SIZE" \
-  --small-size "$SMALL_SIZE" --small-stride "$SMALL_SIZE" \
+PYTHON_ARGS="\
+  --data-root $DATA_ROOT \
+  --split $SPLIT \
+  --size-stats-n $SIZE_STATS_N \
+  --cluster-num-images $CLUSTER_NUM_IMAGES \
+  --viz-num-images $VIZ_NUM_IMAGES \
+  --pad-size $PAD_SIZE \
+  --large-size $LARGE_SIZE --large-stride $LARGE_STRIDE \
+  --small-size $SMALL_SIZE --small-stride $SMALL_STRIDE \
   --embedder dinov2 \
   --device cuda \
-  --clusterer "$CLUSTERER" \
-  --k "$K" \
-  --fit-small-patches-per-image "$FIT_SMALL_PATCHES_PER_IMAGE" \
-  --pca-dim "$PCA_DIM" \
-  --hdbscan-min-cluster-size "$MIN_CLUSTER_SIZE" \
-  --hdbscan-min-samples "$MIN_SAMPLES" \
-  --hdbscan-jobs "$HDBSCAN_JOBS" \
-  --assign-noise-to-nearest-centroid
+  --clusterer $CLUSTERER \
+  --k $K \
+  --fit-small-patches-per-image $FIT_SMALL_PATCHES_PER_IMAGE \
+  --pca-dim $PCA_DIM \
+  --hdbscan-min-cluster-size $MIN_CLUSTER_SIZE \
+  --hdbscan-min-samples $MIN_SAMPLES \
+  --hdbscan-jobs $HDBSCAN_JOBS \
+  --assign-noise-to-nearest-centroid"
+
+# Append per-axis stride overrides if specified
+if [ -n "$SMALL_STRIDE_X" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --small-stride-x $SMALL_STRIDE_X"
+fi
+if [ -n "$SMALL_STRIDE_Y" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --small-stride-y $SMALL_STRIDE_Y"
+fi
+if [ -n "$LARGE_STRIDE_X" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --large-stride-x $LARGE_STRIDE_X"
+fi
+if [ -n "$LARGE_STRIDE_Y" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --large-stride-y $LARGE_STRIDE_Y"
+fi
+
+python -u scripts/viz_fmow_patch_embed_cluster.py $PYTHON_ARGS
 
 echo "Done: $(date)"

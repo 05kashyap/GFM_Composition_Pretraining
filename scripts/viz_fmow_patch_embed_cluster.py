@@ -178,14 +178,36 @@ def _load_and_standardize_image(path: Path, max_edge: int, pad_size: int) -> Ima
 
 
 def _extract_grid_patches(w: int, h: int, patch: int, stride: int) -> List[Patch]:
-    if patch <= 0 or stride <= 0:
-        raise ValueError("patch and stride must be positive")
+    """Legacy grid extraction (uniform stride). Prefer _extract_sliding_window_patches."""
+    return _extract_sliding_window_patches(w, h, patch_w=patch, patch_h=patch,
+                                           stride_x=stride, stride_y=stride)
 
+
+def _extract_sliding_window_patches(
+    w: int, h: int,
+    patch_w: int, patch_h: int,
+    stride_x: int, stride_y: int,
+) -> List[Patch]:
+    """Sliding-window patch extraction with independent horizontal/vertical strides.
+
+    Args:
+        w, h: Image dimensions.
+        patch_w, patch_h: Window (patch) width and height.
+        stride_x: Horizontal stride (step between columns).
+        stride_y: Vertical stride (step between rows).
+
+    Returns:
+        List of Patch objects covering the image. Only full patches are generated
+        (no partial patches at the right/bottom edges).
+    """
+    if patch_w <= 0 or patch_h <= 0:
+        raise ValueError("patch_w and patch_h must be positive")
+    if stride_x <= 0 or stride_y <= 0:
+        raise ValueError("stride_x and stride_y must be positive")
     patches: List[Patch] = []
-    # Only full patches (simplest + most reproducible)
-    for y0 in range(0, h - patch + 1, stride):
-        for x0 in range(0, w - patch + 1, stride):
-            patches.append(Patch(x0=x0, y0=y0, x1=x0 + patch, y1=y0 + patch))
+    for y0 in range(0, h - patch_h + 1, stride_y):
+        for x0 in range(0, w - patch_w + 1, stride_x):
+            patches.append(Patch(x0=x0, y0=y0, x1=x0 + patch_w, y1=y0 + patch_h))
     return patches
 
 
@@ -193,10 +215,14 @@ def _crop(img: Image.Image, patch: Patch) -> Image.Image:
     return img.crop((patch.x0, patch.y0, patch.x1, patch.y1))
 
 
-def _overlay_grid(ax, w: int, h: int, patch: int, stride: int, color: str, lw: float = 1.0):
-    for y in range(0, h + 1, stride):
+def _overlay_grid(ax, w: int, h: int, patch: int, stride: int, color: str, lw: float = 1.0,
+                   stride_x: Optional[int] = None, stride_y: Optional[int] = None):
+    """Draw grid lines. If stride_x/stride_y are given they override *stride*."""
+    sx = stride_x if stride_x is not None else stride
+    sy = stride_y if stride_y is not None else stride
+    for y in range(0, h + 1, sy):
         ax.plot([0, w], [y, y], color=color, linewidth=lw)
-    for x in range(0, w + 1, stride):
+    for x in range(0, w + 1, sx):
         ax.plot([x, x], [0, h], color=color, linewidth=lw)
 
 
@@ -389,6 +415,8 @@ def _cache_key(
     pad_size: int,
     small_size: int,
     small_stride: int,
+    small_stride_x: Optional[int] = None,
+    small_stride_y: Optional[int] = None,
     local_weights: str,
 ) -> str:
     st = None
@@ -397,13 +425,16 @@ def _cache_key(
             st = os.stat(local_weights)
     except Exception:
         st = None
+    sx = small_stride_x if small_stride_x is not None else small_stride
+    sy = small_stride_y if small_stride_y is not None else small_stride
     payload = {
         "image": str(image_path),
         "embedder": str(embedder_name),
         "max_edge": int(max_edge),
         "pad_size": int(pad_size),
         "small_size": int(small_size),
-        "small_stride": int(small_stride),
+        "small_stride_x": int(sx),
+        "small_stride_y": int(sy),
         "weights_path": str(local_weights),
         "weights_mtime": float(st.st_mtime) if st is not None else None,
         "weights_size": int(st.st_size) if st is not None else None,
@@ -425,6 +456,8 @@ def _get_or_compute_small_patch_embeddings(
     pad_size: int,
     small_size: int,
     small_stride: int,
+    small_stride_x: Optional[int] = None,
+    small_stride_y: Optional[int] = None,
     local_weights: str,
     enable_cache: bool,
 ) -> np.ndarray:
@@ -442,6 +475,8 @@ def _get_or_compute_small_patch_embeddings(
         pad_size=pad_size,
         small_size=small_size,
         small_stride=small_stride,
+        small_stride_x=small_stride_x,
+        small_stride_y=small_stride_y,
         local_weights=local_weights,
     )
     fpath = cache_dir / f"{key}.npz"
@@ -668,7 +703,7 @@ def _colorize_small_patch_grid(
     grid_w: int,
     grid_h: int,
 ) -> np.ndarray:
-    """Create an RGB overlay for a small-patch grid."""
+    """Create an RGBA overlay for small patches with alpha-blending for overlapping regions."""
 
     # Pick a colormap that can handle many clusters
     n_labels = max(int(labels.max()) + 1, 1) if labels.size > 0 else 1
@@ -676,18 +711,27 @@ def _colorize_small_patch_grid(
         cmap = plt.get_cmap("tab20")
     else:
         cmap = plt.get_cmap("nipy_spectral", n_labels)
-    overlay = np.zeros((grid_h, grid_w, 4), dtype=np.float32)
 
-    # Each patch is filled with its cluster color at alpha=0.45
+    # Accumulate colours with a count buffer so overlapping windows blend.
+    color_acc = np.zeros((grid_h, grid_w, 3), dtype=np.float64)
+    count = np.zeros((grid_h, grid_w), dtype=np.float64)
+
     for p, lab in zip(small_patches, labels):
         if n_labels <= 20:
             r, g, b, _ = cmap(int(lab) % 20)
         else:
             r, g, b, _ = cmap(int(lab) / max(n_labels - 1, 1))
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 0] = r
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 1] = g
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 2] = b
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 3] = 0.45
+        color_acc[p.y0 : p.y1, p.x0 : p.x1, 0] += r
+        color_acc[p.y0 : p.y1, p.x0 : p.x1, 1] += g
+        color_acc[p.y0 : p.y1, p.x0 : p.x1, 2] += b
+        count[p.y0 : p.y1, p.x0 : p.x1] += 1.0
+
+    # Average where there is coverage
+    mask = count > 0
+    overlay = np.zeros((grid_h, grid_w, 4), dtype=np.float32)
+    for c in range(3):
+        overlay[:, :, c][mask] = (color_acc[:, :, c][mask] / count[mask]).astype(np.float32)
+    overlay[:, :, 3][mask] = 0.45
 
     return overlay
 
@@ -707,9 +751,20 @@ def main() -> int:
     parser.add_argument("--max-edge", type=int, default=1024, help="Resize image so max(w,h)<=max-edge")
     parser.add_argument("--pad-size", type=int, default=1024, help="Pad each image to pad-size x pad-size")
     parser.add_argument("--large-size", type=int, default=256)
-    parser.add_argument("--large-stride", type=int, default=256)
+    parser.add_argument("--large-stride", type=int, default=256,
+                        help="Uniform large-patch stride (overridden by --large-stride-x/y)")
+    parser.add_argument("--large-stride-x", type=int, default=None,
+                        help="Large-patch horizontal stride (defaults to --large-stride)")
+    parser.add_argument("--large-stride-y", type=int, default=None,
+                        help="Large-patch vertical stride (defaults to --large-stride)")
     parser.add_argument("--small-size", type=int, default=64)
-    parser.add_argument("--small-stride", type=int, default=64)
+    parser.add_argument("--small-stride", type=int, default=32,
+                        help="Uniform small-patch stride (overridden by --small-stride-x/y). "
+                             "Default 32 gives 50%% overlap for 64px patches.")
+    parser.add_argument("--small-stride-x", type=int, default=None,
+                        help="Small-patch horizontal stride (defaults to --small-stride)")
+    parser.add_argument("--small-stride-y", type=int, default=None,
+                        help="Small-patch vertical stride (defaults to --small-stride)")
 
     parser.add_argument(
         "--embedder",
@@ -775,12 +830,20 @@ def main() -> int:
 
     args = parser.parse_args()
 
+    # Resolve per-axis strides (fall back to uniform --small-stride / --large-stride)
+    args.small_stride_x = args.small_stride_x if args.small_stride_x is not None else args.small_stride
+    args.small_stride_y = args.small_stride_y if args.small_stride_y is not None else args.small_stride
+    args.large_stride_x = args.large_stride_x if args.large_stride_x is not None else args.large_stride
+    args.large_stride_y = args.large_stride_y if args.large_stride_y is not None else args.large_stride
+
     _seed_all(args.seed)
 
     data_root = Path(args.data_root)
     split_dir = data_root / args.split
     all_paths = _find_jpgs(data_root, args.split)
     print(f"Total images found: {len(all_paths)}")
+    print(f"Sliding window: patch={args.small_size}x{args.small_size}  "
+          f"stride_x={args.small_stride_x}  stride_y={args.small_stride_y}")
 
     rng = random.Random(args.seed)
 
@@ -861,8 +924,10 @@ def main() -> int:
             raise RuntimeError("Expected padded image")
 
         # Small patches directly on full padded image
-        small_patches_full = _extract_grid_patches(
-            pw, ph, patch=args.small_size, stride=args.small_stride
+        small_patches_full = _extract_sliding_window_patches(
+            pw, ph,
+            patch_w=args.small_size, patch_h=args.small_size,
+            stride_x=args.small_stride_x, stride_y=args.small_stride_y,
         )
         if args.small_patches_per_image and args.small_patches_per_image > 0:
             # Sample a subset for faster runs
@@ -997,6 +1062,8 @@ def main() -> int:
                 pad_size=args.pad_size,
                 small_size=args.small_size,
                 small_stride=args.small_stride,
+                small_stride_x=args.small_stride_x,
+                small_stride_y=args.small_stride_y,
                 local_weights=args.local_weights,
                 enable_cache=bool(args.cache_embeddings),
             )
@@ -1048,8 +1115,10 @@ def main() -> int:
                 stride=args.large_stride,
                 color="lime",
                 lw=1.0,
+                stride_x=args.large_stride_x,
+                stride_y=args.large_stride_y,
             )
-            axs[1].set_title(f"Large grid {args.large_size}x{args.large_size}")
+            axs[1].set_title(f"Large grid {args.large_size}  sx={args.large_stride_x} sy={args.large_stride_y}")
             axs[1].axis("off")
 
             axs[2].imshow(img)
@@ -1153,6 +1222,8 @@ def main() -> int:
                 pad_size=args.pad_size,
                 small_size=args.small_size,
                 small_stride=args.small_stride,
+                small_stride_x=args.small_stride_x,
+                small_stride_y=args.small_stride_y,
                 local_weights=args.local_weights,
                 enable_cache=bool(args.cache_embeddings),
             )
@@ -1185,8 +1256,10 @@ def main() -> int:
                 axs[1], w=pw, h=ph,
                 patch=args.large_size, stride=args.large_stride,
                 color="lime", lw=1.0,
+                stride_x=args.large_stride_x,
+                stride_y=args.large_stride_y,
             )
-            axs[1].set_title(f"Large grid {args.large_size}x{args.large_size}")
+            axs[1].set_title(f"Large grid {args.large_size}  sx={args.large_stride_x} sy={args.large_stride_y}")
             axs[1].axis("off")
 
             axs[2].imshow(img)
@@ -1232,6 +1305,8 @@ def main() -> int:
                 pad_size=args.pad_size,
                 small_size=args.small_size,
                 small_stride=args.small_stride,
+                small_stride_x=args.small_stride_x,
+                small_stride_y=args.small_stride_y,
                 local_weights=args.local_weights,
                 enable_cache=bool(args.cache_embeddings),
             )
@@ -1258,6 +1333,8 @@ def main() -> int:
                 pad_size=args.pad_size,
                 small_size=args.small_size,
                 small_stride=args.small_stride,
+                small_stride_x=args.small_stride_x,
+                small_stride_y=args.small_stride_y,
                 local_weights=args.local_weights,
                 enable_cache=bool(args.cache_embeddings),
             )
@@ -1290,8 +1367,10 @@ def main() -> int:
                     stride=args.large_stride,
                     color="lime",
                     lw=1.0,
+                    stride_x=args.large_stride_x,
+                    stride_y=args.large_stride_y,
                 )
-                axs[1].set_title(f"Large grid {args.large_size}x{args.large_size}")
+                axs[1].set_title(f"Large grid {args.large_size}  sx={args.large_stride_x} sy={args.large_stride_y}")
                 axs[1].axis("off")
                 axs[2].imshow(img)
                 overlay = _colorize_small_patch_grid(
@@ -1350,9 +1429,11 @@ def main() -> int:
         "max_edge": args.max_edge,
         "pad_size": args.pad_size,
         "large_size": args.large_size,
-        "large_stride": args.large_stride,
+        "large_stride_x": args.large_stride_x,
+        "large_stride_y": args.large_stride_y,
         "small_size": args.small_size,
-        "small_stride": args.small_stride,
+        "small_stride_x": args.small_stride_x,
+        "small_stride_y": args.small_stride_y,
         "embedder": embedder.name,
         "device": args.device,
         "embedding_dim": embedder.embedding_dim,

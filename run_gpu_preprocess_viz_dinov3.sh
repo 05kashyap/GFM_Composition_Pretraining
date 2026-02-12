@@ -84,12 +84,25 @@ VIZ_NUM_IMAGES=100
 PAD_SIZE=1024
 LARGE_SIZE=512
 SMALL_SIZE=128
+# Sliding window strides (default: 50% overlap → stride = size / 2)
+SMALL_STRIDE=64
+SMALL_STRIDE_X=""  # empty = use SMALL_STRIDE for both axes
+SMALL_STRIDE_Y=""
+LARGE_STRIDE="$LARGE_SIZE"
+LARGE_STRIDE_X=""
+LARGE_STRIDE_Y=""
 
 # DINOv3 SAT local weights
 WEIGHTS_PATH="weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
-# Embedding batch size (patches per forward pass through ViT)
-EMBED_BATCH=64
+# Embedding batch size (patches to accumulate across multiple images)
+# With 128px patches + 64px stride on 1024px images, each image produces ~225 patches.
+# EMBED_BATCH controls when the MultiImageBatchedEmbedder flushes accumulated patches
+# to the GPU.  Setting this to ~9-18× patches-per-image (2048) ensures the GPU gets
+# large batches while GPU_BATCH_SIZE controls the actual per-forward-pass sub-batch.
+EMBED_BATCH=2048
+# GPU batch size (patches per ViT forward pass - increase to use more VRAM)
+GPU_BATCH_SIZE=512
 
 # Clustering defaults: kmeans with k=100
 CLUSTERER="sklearn_kmeans"
@@ -126,12 +139,26 @@ while [[ $# -gt 0 ]]; do
       WEIGHTS_PATH="$2"; shift 2 ;;
     --embed-batch)
       EMBED_BATCH="$2"; shift 2 ;;
+    --gpu-batch-size)
+      GPU_BATCH_SIZE="$2"; shift 2 ;;
     --pca-dim)
       PCA_DIM="$2"; shift 2 ;;
     --fit-small-patches-per-image)
       FIT_SMALL_PATCHES_PER_IMAGE="$2"; shift 2 ;;
     --num-gpus)
       NUM_GPUS="$2"; shift 2 ;;
+    --small-stride)
+      SMALL_STRIDE="$2"; shift 2 ;;
+    --small-stride-x)
+      SMALL_STRIDE_X="$2"; shift 2 ;;
+    --small-stride-y)
+      SMALL_STRIDE_Y="$2"; shift 2 ;;
+    --large-stride)
+      LARGE_STRIDE="$2"; shift 2 ;;
+    --large-stride-x)
+      LARGE_STRIDE_X="$2"; shift 2 ;;
+    --large-stride-y)
+      LARGE_STRIDE_Y="$2"; shift 2 ;;
     *)
       echo "Unknown arg: $1"; shift ;;
   esac
@@ -146,8 +173,10 @@ echo "  viz_num_images: $VIZ_NUM_IMAGES"
 echo "  pad_size: $PAD_SIZE"
 echo "  large_size: $LARGE_SIZE"
 echo "  small_size: $SMALL_SIZE"
+echo "  small_stride: $SMALL_STRIDE (stride_x=${SMALL_STRIDE_X:-$SMALL_STRIDE} stride_y=${SMALL_STRIDE_Y:-$SMALL_STRIDE})"
 echo "  weights_path: $WEIGHTS_PATH"
 echo "  embed_batch: $EMBED_BATCH"
+echo "  gpu_batch_size: $GPU_BATCH_SIZE"
 echo "  clusterer: $CLUSTERER"
 echo "  k: $K"
 echo "  fit_small_patches_per_image: $FIT_SMALL_PATCHES_PER_IMAGE"
@@ -170,10 +199,11 @@ PYTHON_ARGS="\
   --viz-num-images $VIZ_NUM_IMAGES \
   --max-edge $PAD_SIZE \
   --pad-size $PAD_SIZE \
-  --large-size $LARGE_SIZE --large-stride $LARGE_SIZE \
-  --small-size $SMALL_SIZE --small-stride $SMALL_SIZE \
+  --large-size $LARGE_SIZE --large-stride $LARGE_STRIDE \
+  --small-size $SMALL_SIZE --small-stride $SMALL_STRIDE \
   --weights-path $WEIGHTS_PATH \
   --embed-batch $EMBED_BATCH \
+  --gpu-batch-size $GPU_BATCH_SIZE \
   --clusterer $CLUSTERER \
   --k $K \
   --fit-small-patches-per-image $FIT_SMALL_PATCHES_PER_IMAGE \
@@ -183,6 +213,20 @@ PYTHON_ARGS="\
   --hdbscan-jobs $HDBSCAN_JOBS \
   --cache-embeddings \
   --save-embeddings"
+
+# Append per-axis stride overrides if specified
+if [ -n "$SMALL_STRIDE_X" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --small-stride-x $SMALL_STRIDE_X"
+fi
+if [ -n "$SMALL_STRIDE_Y" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --small-stride-y $SMALL_STRIDE_Y"
+fi
+if [ -n "$LARGE_STRIDE_X" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --large-stride-x $LARGE_STRIDE_X"
+fi
+if [ -n "$LARGE_STRIDE_Y" ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --large-stride-y $LARGE_STRIDE_Y"
+fi
 
 if [ "$NUM_GPUS" -gt 1 ]; then
     # ==========================================================================

@@ -53,10 +53,25 @@ class Patch:
 
 
 def _extract_grid_patches(w: int, h: int, patch: int, stride: int) -> List[Patch]:
+    """Legacy grid extraction (uniform stride). Prefer _extract_sliding_window_patches."""
+    return _extract_sliding_window_patches(w, h, patch_w=patch, patch_h=patch,
+                                           stride_x=stride, stride_y=stride)
+
+
+def _extract_sliding_window_patches(
+    w: int, h: int,
+    patch_w: int, patch_h: int,
+    stride_x: int, stride_y: int,
+) -> List[Patch]:
+    """Sliding-window patch extraction with independent horizontal/vertical strides."""
+    if patch_w <= 0 or patch_h <= 0:
+        raise ValueError("patch_w and patch_h must be positive")
+    if stride_x <= 0 or stride_y <= 0:
+        raise ValueError("stride_x and stride_y must be positive")
     out: List[Patch] = []
-    for y0 in range(0, h - patch + 1, stride):
-        for x0 in range(0, w - patch + 1, stride):
-            out.append(Patch(x0=x0, y0=y0, x1=x0 + patch, y1=y0 + patch))
+    for y0 in range(0, h - patch_h + 1, stride_y):
+        for x0 in range(0, w - patch_w + 1, stride_x):
+            out.append(Patch(x0=x0, y0=y0, x1=x0 + patch_w, y1=y0 + patch_h))
     return out
 
 
@@ -100,32 +115,45 @@ def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return x / denom
 
 
-def _overlay_grid(ax, w: int, h: int, patch: int, stride: int, color: str, lw: float = 1.0):
-    for y in range(0, h + 1, stride):
+def _overlay_grid(ax, w: int, h: int, patch: int, stride: int, color: str, lw: float = 1.0,
+                   stride_x: Optional[int] = None, stride_y: Optional[int] = None):
+    """Draw grid lines. If stride_x/stride_y are given they override *stride*."""
+    sx = stride_x if stride_x is not None else stride
+    sy = stride_y if stride_y is not None else stride
+    for y in range(0, h + 1, sy):
         ax.plot([0, w], [y, y], color=color, linewidth=lw)
-    for x in range(0, w + 1, stride):
+    for x in range(0, w + 1, sx):
         ax.plot([x, x], [0, h], color=color, linewidth=lw)
 
 
 def _colorize_small_patch_grid(
     small_patches: List[Patch], labels: np.ndarray, grid_w: int, grid_h: int
 ) -> np.ndarray:
+    """Colorize patches by cluster label with alpha-blending for overlapping regions."""
     n_labels = max(int(labels.max()) + 1, 1) if labels.size > 0 else 1
     if n_labels <= 20:
         cmap = plt.get_cmap("tab20")
     else:
         cmap = plt.get_cmap("nipy_spectral", n_labels)
 
-    overlay = np.zeros((grid_h, grid_w, 4), dtype=np.float32)
+    color_acc = np.zeros((grid_h, grid_w, 3), dtype=np.float64)
+    count = np.zeros((grid_h, grid_w), dtype=np.float64)
+
     for p, lab in zip(small_patches, labels):
         if n_labels <= 20:
             r, g, b, _ = cmap(int(lab) % 20)
         else:
             r, g, b, _ = cmap(int(lab) / max(n_labels - 1, 1))
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 0] = r
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 1] = g
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 2] = b
-        overlay[p.y0 : p.y1, p.x0 : p.x1, 3] = 0.45
+        color_acc[p.y0 : p.y1, p.x0 : p.x1, 0] += r
+        color_acc[p.y0 : p.y1, p.x0 : p.x1, 1] += g
+        color_acc[p.y0 : p.y1, p.x0 : p.x1, 2] += b
+        count[p.y0 : p.y1, p.x0 : p.x1] += 1.0
+
+    mask = count > 0
+    overlay = np.zeros((grid_h, grid_w, 4), dtype=np.float32)
+    for c in range(3):
+        overlay[:, :, c][mask] = (color_acc[:, :, c][mask] / count[mask]).astype(np.float32)
+    overlay[:, :, 3][mask] = 0.45
     return overlay
 
 
@@ -213,7 +241,16 @@ def main() -> int:
     patches_per_image = int(data["patches_per_image"])
     pad_size = int(data["pad_size"])
     small_size = int(data["small_size"])
-    small_stride = int(data["small_stride"])
+    # Support both old ("small_stride") and new ("small_stride_x/y") npz formats
+    if "small_stride_x" in data:
+        small_stride_x = int(data["small_stride_x"])
+        small_stride_y = int(data["small_stride_y"])
+    elif "small_stride" in data:
+        small_stride_x = int(data["small_stride"])
+        small_stride_y = int(data["small_stride"])
+    else:
+        small_stride_x = small_size
+        small_stride_y = small_size
     max_edge = int(data["max_edge"])
 
     # Optional: also load PCA dim info
@@ -227,7 +264,7 @@ def main() -> int:
     print(f"  Patches per image: {patches_per_image}")
     print(f"  Total patch embeddings: {total_patches} (expected {expected_patches})")
     print(f"  PCA dim: {pca_dim}")
-    print(f"  Pad size: {pad_size}, Small patch: {small_size}, Stride: {small_stride}")
+    print(f"  Pad size: {pad_size}, Small patch: {small_size}, Stride_x: {small_stride_x}, Stride_y: {small_stride_y}")
     print(f"  Max edge: {max_edge}")
     print(f"  k values to sweep: {k_values}")
     print()
@@ -245,8 +282,10 @@ def main() -> int:
     viz_indices.sort()
 
     # Build the small-patch grid template (same for all images since they're all padded to pad_size)
-    small_patches_template = _extract_grid_patches(
-        pad_size, pad_size, patch=small_size, stride=small_stride
+    small_patches_template = _extract_sliding_window_patches(
+        pad_size, pad_size,
+        patch_w=small_size, patch_h=small_size,
+        stride_x=small_stride_x, stride_y=small_stride_y,
     )
     assert len(small_patches_template) == patches_per_image, (
         f"Grid gives {len(small_patches_template)} patches but data has {patches_per_image}"
