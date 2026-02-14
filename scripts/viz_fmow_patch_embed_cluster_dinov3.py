@@ -6,17 +6,23 @@ This is a standalone script and does NOT touch the existing DynamicVis pipeline.
 Key differences vs the non-DINOv3 script:
 - Uses local DINOv3 ViT-L/16 .pth weights from disk (no HuggingFace required).
 - Adds an on-disk embedding cache so patch embeddings don't need recomputation.
+- 2D RoPE is applied per-head inside attention (Q & K for patch tokens only).
+- Patches are fed at native 128×128 resolution (no resize to 224).
+- Pool modes: "cls" (1024-d), "avg" (1024-d), "cls_avg" (2048-d, default).
 
 Workflow:
 0) (Optional) Sample N images and plot width/height distribution.
 1) Load local FMoW images from data/fmow/<split>/...
-2) Resize so max(width,height) <= --max-edge, then pad to --pad-size x --pad-size.
-3) Divide each padded image into overlapping patches via a sliding window
-   (default 128x128 with 50% overlap, stride 64). Independent horizontal
-   and vertical strides are supported (--small-stride-x / --small-stride-y).
-4) Embed selected small patches with DINOv3 weights.
-5) Cluster embeddings (HDBSCAN or fixed-k clusterers).
-6) Visualize intermediate steps and plot cluster sizes.
+2) Resize so the image dimensions are multiples of --grid-size (default 512).
+3) Extract non-overlapping grid cells of --grid-size x --grid-size, then
+   extract overlapping patches within each cell via a sliding window
+   (default 128×128 with configurable --small-stride-x / --small-stride-y).
+4) Embed patches with DINOv3-SAT weights at native resolution (128×128 →
+   8×8 = 64 ViT tokens per patch).  Pool mode selects CLS, spatial-avg,
+   or CLS+avg concatenation.
+5) (Optional) PCA to reduce dimensionality, then L2-normalize.
+6) Cluster embeddings (HDBSCAN or fixed-k clusterers).
+7) Visualize intermediate steps and plot cluster sizes.
 
 Outputs are saved under: outputs/preprocess_viz_dinov3/<run_id>/
 Cache is stored under: outputs/preprocess_cache_dinov3/ (configurable)
@@ -72,6 +78,22 @@ class Patch:
     y1: int
 
 
+@dataclass(frozen=True)
+class GridCell:
+    """A single large-patch (grid cell) and the small patches it contains.
+
+    Each grid cell is treated as an independent entity.  Its embeddings are
+    cached and stored separately.
+    """
+    row: int          # grid row index (0-based)
+    col: int          # grid column index (0-based)
+    x0: int           # pixel coords in the full (resized) image
+    y0: int
+    x1: int
+    y1: int
+    patches: List[Patch]  # small patches (coords in full-image space)
+
+
 def _find_jpgs(data_root: Path, split: str) -> List[Path]:
     split_dir = data_root / split
     if not split_dir.exists():
@@ -118,40 +140,87 @@ def _sample_stratified(all_paths: List[Path], split_dir: Path, n: int, rng: rand
     return sampled
 
 
-def _resize_max_edge(img: Image.Image, max_edge: int) -> Image.Image:
-    if max_edge <= 0:
-        return img
+def _resize_to_grid(img: Image.Image, grid_size: int) -> Image.Image:
+    """Resize image so both width and height are the nearest multiple of *grid_size*.
+
+    The minimum dimension is clamped to *grid_size* so every image has at
+    least one grid cell.  Standard rounding is used: dimensions closer to the
+    lower multiple round down, those closer to the upper multiple round up.
+    """
+    if grid_size <= 0:
+        raise ValueError("grid_size must be positive")
     w, h = img.size
-    scale = max_edge / max(w, h)
-    if scale >= 1.0:
+    new_w = max(grid_size, round(w / grid_size) * grid_size)
+    new_h = max(grid_size, round(h / grid_size) * grid_size)
+    if new_w == w and new_h == h:
         return img
-    new_w, new_h = int(round(w * scale)), int(round(h * scale))
     return img.resize((new_w, new_h), Image.BICUBIC)
 
 
-def _pad_to_square(img: Image.Image, size: int, fill: Tuple[int, int, int] = (0, 0, 0)) -> Image.Image:
-    w, h = img.size
-    if w > size or h > size:
-        raise ValueError(f"Image {w}x{h} larger than pad {size}; reduce via --max-edge")
-    if w == size and h == size:
-        return img
-    canvas = Image.new("RGB", (size, size), fill)
-    x0 = (size - w) // 2
-    y0 = (size - h) // 2
-    canvas.paste(img, (x0, y0))
-    return canvas
-
-
-def _load_and_standardize_image(path: Path, max_edge: int, pad_size: int) -> Image.Image:
+def _load_and_standardize_image(path: Path, grid_size: int) -> Image.Image:
+    """Load image, convert to RGB, resize so dims are multiples of *grid_size*."""
     img = Image.open(path)
     try:
-        img.draft("RGB", (max_edge, max_edge))
+        # Hint PIL to use a draft mode for faster decoding of large images
+        img.draft("RGB", (grid_size * 8, grid_size * 8))
     except Exception:
         pass
     img = img.convert("RGB")
-    img = _resize_max_edge(img, max_edge=max_edge)
-    img = _pad_to_square(img, size=pad_size, fill=(0, 0, 0))
+    img = _resize_to_grid(img, grid_size=grid_size)
     return img
+
+
+def _extract_patches_in_grid(
+    img_w: int,
+    img_h: int,
+    large_size: int,
+    small_size: int,
+    small_stride_x: int,
+    small_stride_y: int,
+) -> List[GridCell]:
+    """Extract small patches confined within non-overlapping large (grid) patches.
+
+    The image is tiled into *large_size* x *large_size* cells.  Within each
+    cell, 128x128 small patches are extracted with the given strides.  Small
+    patches never cross large-patch boundaries.
+
+    Returns a list of :class:`GridCell` objects, one per grid cell, each
+    containing the small patches (in full-image pixel coordinates) that
+    belong to that cell.
+    """
+    if img_w % large_size != 0 or img_h % large_size != 0:
+        raise ValueError(
+            f"Image {img_w}x{img_h} not evenly divisible by large_size={large_size}. "
+            "Resize to a multiple of large_size first."
+        )
+    cells: List[GridCell] = []
+    grid_row = 0
+    for ly in range(0, img_h, large_size):
+        grid_col = 0
+        for lx in range(0, img_w, large_size):
+            cell_patches: List[Patch] = []
+            for sy in range(0, large_size - small_size + 1, small_stride_y):
+                for sx in range(0, large_size - small_size + 1, small_stride_x):
+                    cell_patches.append(Patch(
+                        x0=lx + sx,
+                        y0=ly + sy,
+                        x1=lx + sx + small_size,
+                        y1=ly + sy + small_size,
+                    ))
+            cells.append(GridCell(
+                row=grid_row, col=grid_col,
+                x0=lx, y0=ly,
+                x1=lx + large_size, y1=ly + large_size,
+                patches=cell_patches,
+            ))
+            grid_col += 1
+        grid_row += 1
+    return cells
+
+
+def _flatten_cells(cells: List[GridCell]) -> List[Patch]:
+    """Flatten grid cells into a single ordered list of small patches."""
+    return [p for c in cells for p in c.patches]
 
 
 def _extract_grid_patches(w: int, h: int, patch: int, stride: int) -> List[Patch]:
@@ -255,44 +324,48 @@ def _strip_known_prefixes(k: str) -> str:
 # Native DINOv3 ViT-L/16 model definition (matches checkpoint keys)
 # ---------------------------------------------------------------
 
+def _rope_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate paired dimensions for 2-D RoPE: [a,b,c,d] -> [-b,a,-d,c].
+
+    Works on the last dimension which has size head_dim = 4 * n_periods.
+    The four groups correspond to (y_sin, y_cos, x_sin, x_cos).
+    """
+    quarter = x.shape[-1] // 4
+    x1, x2, x3, x4 = (x[..., :quarter], x[..., quarter:2*quarter],
+                        x[..., 2*quarter:3*quarter], x[..., 3*quarter:])
+    return torch.cat([-x2, x1, -x4, x3], dim=-1)
+
+
 class _RoPE2D(torch.nn.Module):
-    """2-D Rotary Position Embedding for vision transformers."""
+    """2-D Rotary Position Embedding applied per attention head.
+
+    Computes cos/sin grids at *head_dim* = 4 * n_periods granularity.
+    Applied to Q and K inside each attention block (not to full-dim tokens).
+    """
 
     def __init__(self, dim: int, n_periods: int = 16, max_res: int = 256):
         super().__init__()
         # The checkpoint stores learned periods of shape (n_periods,)
         self.register_buffer("periods", torch.arange(n_periods).float(), persistent=True)
+        self.n_periods = n_periods
         self.max_res = max_res
+        # dim kept for compat but not used; head_dim = 4 * n_periods = 64
         self._dim = dim
 
-    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
-        """x: (B, N, D) where N = h*w (no cls/register tokens)."""
-        device = x.device
-        dtype = x.dtype
-        half = self._dim // 4
-
-        freqs = 1.0 / (10000.0 ** (self.periods / half))  # (half,)
+    def get_cos_sin(
+        self, h: int, w: int, device: torch.device, dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (cos, sin) each of shape (h*w, head_dim) for RoPE."""
+        half = self.n_periods  # 16;  head_dim = 4 * 16 = 64
+        freqs = 1.0 / (10000.0 ** (self.periods / half))  # (16,)
         gy = torch.arange(h, device=device, dtype=dtype)
         gx = torch.arange(w, device=device, dtype=dtype)
-        fy = torch.outer(gy, freqs)  # (h, half)
-        fx = torch.outer(gx, freqs)  # (w, half)
-
+        fy = torch.outer(gy, freqs)  # (h, 16)
+        fx = torch.outer(gx, freqs)  # (w, 16)
         fy = fy[:, None, :].expand(h, w, half).reshape(h * w, half)
         fx = fx[None, :, :].expand(h, w, half).reshape(h * w, half)
-        angles = torch.cat([fy, fy, fx, fx], dim=-1)  # (h*w, dim)
-
-        cos_ = torch.cos(angles).unsqueeze(0)
-        sin_ = torch.sin(angles).unsqueeze(0)
-
-        x1 = x[..., : self._dim]
-        x2 = x[..., self._dim :]
-
-        x1_rot = torch.stack([-x1[..., half : 2 * half],
-                               x1[..., : half],
-                               -x1[..., 3 * half :],
-                               x1[..., 2 * half : 3 * half]], dim=-1).reshape_as(x1)
-        x1 = x1 * cos_ + x1_rot * sin_
-        return torch.cat([x1, x2], dim=-1)
+        angles = torch.cat([fy, fy, fx, fx], dim=-1)  # (h*w, 64)
+        return torch.cos(angles), torch.sin(angles)
 
 
 class _Attention(torch.nn.Module):
@@ -306,13 +379,38 @@ class _Attention(torch.nn.Module):
         self.register_buffer("qkv_bias_mask", torch.ones(dim * 3), persistent=False)
         self.proj = torch.nn.Linear(dim, dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+        num_prefix: int = 0,
+    ) -> torch.Tensor:
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        q, k, v = qkv.unbind(0)  # each (B, H, N, head_dim)
+
+        if rope_cos is not None:
+            # Apply 2-D RoPE to patch tokens only (skip CLS + register prefix)
+            cos = rope_cos.unsqueeze(0).unsqueeze(0)  # (1, 1, N_patch, head_dim)
+            sin = rope_sin.unsqueeze(0).unsqueeze(0)
+            q_patch = q[:, :, num_prefix:] * cos + _rope_rotate_half(q[:, :, num_prefix:]) * sin
+            k_patch = k[:, :, num_prefix:] * cos + _rope_rotate_half(k[:, :, num_prefix:]) * sin
+            q = torch.cat([q[:, :, :num_prefix], q_patch], dim=2)
+            k = torch.cat([k[:, :, :num_prefix], k_patch], dim=2)
+
+        # Compute attention in fp32 to prevent fp16 overflow → NaN.
+        # Q·K^T dot products over dim=64 can exceed fp16 max (65504),
+        # causing inf → softmax NaN.  We must disable autocast here because
+        # autocast re-casts explicit .float() inputs back to fp16 for matmuls.
+        input_dtype = q.dtype
+        with torch.cuda.amp.autocast(enabled=False):
+            q = q.float()
+            k = k.float()
+            v = v.float()
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = x.to(input_dtype)
         x = self.proj(x)
         return x
 
@@ -348,8 +446,15 @@ class _Block(torch.nn.Module):
         self.mlp = _Mlp(dim, mlp_ratio=mlp_ratio)
         self.ls2 = _LayerScale(dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.ls1(self.attn(self.norm1(x)))
+    def forward(
+        self, x: torch.Tensor,
+        rope_cos: Optional[torch.Tensor] = None,
+        rope_sin: Optional[torch.Tensor] = None,
+        num_prefix: int = 0,
+    ) -> torch.Tensor:
+        x = x + self.ls1(self.attn(
+            self.norm1(x), rope_cos=rope_cos, rope_sin=rope_sin, num_prefix=num_prefix,
+        ))
         x = x + self.ls2(self.mlp(self.norm2(x)))
         return x
 
@@ -392,8 +497,14 @@ class DinoV3SatViTL16(torch.nn.Module):
         self.norm = torch.nn.LayerNorm(embed_dim)
         self.local_cls_norm = torch.nn.LayerNorm(embed_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, 3, H, W) -> (B, embed_dim) cls token output."""
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """x: (B, 3, H, W) -> (cls_emb, patch_embs).
+
+        Returns:
+            cls_emb: (B, D) — CLS token after final LayerNorm.
+            patch_embs: (B, N, D) — spatial patch tokens after final LayerNorm
+                (excludes CLS and register tokens).
+        """
         B = x.shape[0]
         # Patch embed
         tokens = self.patch_embed(x)  # (B, N, D)
@@ -401,17 +512,25 @@ class DinoV3SatViTL16(torch.nn.Module):
         w = x.shape[3] // self.patch_size
 
         # Prepend cls + register tokens
+        num_prefix = 1 + self.num_register_tokens  # 5 (1 CLS + 4 register)
         cls = self.cls_token.expand(B, -1, -1)
         reg = self.storage_tokens.expand(B, -1, -1)
         tokens = torch.cat([cls, reg, tokens], dim=1)  # (B, 1+R+N, D)
 
-        # Forward through blocks
-        for blk in self.blocks:
-            tokens = blk(tokens)
+        # Compute 2-D RoPE cos/sin grids once for the spatial resolution
+        rope_cos, rope_sin = self.rope_embed.get_cos_sin(
+            h, w, device=tokens.device, dtype=tokens.dtype,
+        )
 
-        # Norm and return cls token
+        # Forward through blocks (RoPE applied inside attention to Q/K)
+        for blk in self.blocks:
+            tokens = blk(tokens, rope_cos=rope_cos, rope_sin=rope_sin, num_prefix=num_prefix)
+
+        # Norm
         tokens = self.norm(tokens)
-        return tokens[:, 0]  # cls token
+        cls_out = tokens[:, 0]                   # (B, D)
+        patch_out = tokens[:, num_prefix:]        # (B, N, D)
+        return cls_out, patch_out
 
 
 class DinoV3SatViTL16Embedder(Embedder):
@@ -420,15 +539,25 @@ class DinoV3SatViTL16Embedder(Embedder):
     Loads the .pth into a custom ViT-L/16 that matches the DINOv3 checkpoint
     structure exactly (fused QKV, layer scale, RoPE, register tokens).
 
-    Inputs are resized to 224x224 and normalized with ImageNet stats.
+    Patches are fed at their native resolution (e.g. 128×128) — no resize to
+    224.  RoPE handles variable spatial grids natively.  Pooling mode controls
+    how the (cls, patch_tokens) are aggregated into a single vector:
+
+        "cls"       → CLS token only (1024-d)
+        "avg"       → mean of spatial patch tokens (1024-d)
+        "cls_avg"   → concat(CLS, mean-patch) (2048-d)  [default]
     """
 
-    def __init__(self, device: str, weights_path: str):
+    _POOL_MODES = ("cls", "avg", "cls_avg")
+
+    def __init__(self, device: str, weights_path: str, pool_mode: str = "cls_avg"):
         super().__init__(device=device)
         self.weights_path = str(weights_path)
+        if pool_mode not in self._POOL_MODES:
+            raise ValueError(f"pool_mode must be one of {self._POOL_MODES}, got '{pool_mode}'")
+        self.pool_mode = pool_mode
 
         import torchvision.transforms as T
-        from torchvision.transforms import InterpolationMode
 
         model = DinoV3SatViTL16(
             patch_size=16, embed_dim=1024, depth=24,
@@ -436,10 +565,10 @@ class DinoV3SatViTL16Embedder(Embedder):
         )
         self.model = model.eval().to(self.device)
 
+        # No resize / center-crop: patches are fed at native resolution.
+        # Only normalize with ImageNet stats.
         self.transforms = T.Compose(
             [
-                T.Resize(224, interpolation=InterpolationMode.BICUBIC),
-                T.CenterCrop(224),
                 T.ToTensor(),
                 T.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ]
@@ -479,15 +608,26 @@ class DinoV3SatViTL16Embedder(Embedder):
         if n_missing > 0 or n_unexpected > 0:
             print("  WARNING: significant key mismatch — embeddings may be incorrect!")
 
-        self._embedding_dim = 1024
+        self._embedding_dim = 2048 if pool_mode == "cls_avg" else 1024
+        print(f"  Pool mode: {pool_mode} -> embedding_dim={self._embedding_dim}")
 
     @property
     def name(self) -> str:
-        return f"dinov3_sat:{Path(self.weights_path).name}"
+        return f"dinov3_sat:{Path(self.weights_path).name}:{self.pool_mode}"
 
     @property
     def embedding_dim(self) -> int:
         return self._embedding_dim
+
+    def _pool(self, cls_emb: torch.Tensor, patch_embs: torch.Tensor) -> torch.Tensor:
+        """Aggregate (cls, patch_tokens) into a single embedding vector."""
+        if self.pool_mode == "cls":
+            return cls_emb
+        avg = patch_embs.mean(dim=1)  # (B, D)
+        if self.pool_mode == "avg":
+            return avg
+        # cls_avg: concatenate
+        return torch.cat([cls_emb, avg], dim=-1)  # (B, 2D)
 
     # ImageNet normalization constants (as tensors for fast GPU normalize)
     _IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -504,7 +644,8 @@ class DinoV3SatViTL16Embedder(Embedder):
                 x = x.pin_memory()
             x = x.to(self.device, non_blocking=True)
             with torch.cuda.amp.autocast(enabled=use_amp):
-                embs = self.model(x)
+                cls_emb, patch_embs = self.model(x)
+            embs = self._pool(cls_emb, patch_embs)
             all_embs.append(embs.float().cpu())
         return torch.cat(all_embs, dim=0)
 
@@ -517,9 +658,9 @@ class DinoV3SatViTL16Embedder(Embedder):
     ) -> torch.Tensor:
         """Embed patches from a pre-converted image tensor (fast path).
 
-        Instead of 225 individual PIL.crop + PIL→tensor + resize transforms,
-        this converts the full image to a tensor ONCE, uses tensor slicing for
-        crops, and runs gpu-batched resize + normalize.
+        Patches are fed at their native pixel resolution (e.g. 128×128 →
+        8×8 = 64 ViT tokens) with no resize to 224.  RoPE handles the
+        variable spatial grid.
 
         Optimizations: pre-allocated crop buffer, pinned memory, fp16 autocast.
 
@@ -548,12 +689,11 @@ class DinoV3SatViTL16Embedder(Embedder):
             if self.device.type == "cuda":
                 crops = crops.pin_memory()
             crops = crops.to(self.device, non_blocking=True)
-            # Batched GPU resize to 224x224
-            crops = F.interpolate(crops, size=(224, 224), mode="bicubic", align_corners=False)
-            # Normalize
+            # Normalize (no resize — feed at native 128×128 resolution)
             crops = (crops - mean) / std
             with torch.cuda.amp.autocast(enabled=use_amp):
-                embs = self.model(crops)
+                cls_emb, patch_embs = self.model(crops)
+            embs = self._pool(cls_emb, patch_embs)
             all_embs.append(embs.float().cpu())
         return torch.cat(all_embs, dim=0)
 
@@ -712,28 +852,39 @@ def _colorize_small_patch_grid(small_patches: List[Patch], labels: np.ndarray, g
     return overlay
 
 
-def _save_viz_embeddings(out_dir: Path, shown_idx: int, image_path: Path, patches: List[Patch], emb_raw: np.ndarray, labels: np.ndarray, emb_pca: Optional[np.ndarray] = None) -> None:
+def _save_viz_embeddings(out_dir: Path, shown_idx: int, image_path: Path,
+                         patches: List[Patch], emb_raw: np.ndarray,
+                         labels: np.ndarray, cells: Optional[List[GridCell]] = None,
+                         emb_pca: Optional[np.ndarray] = None) -> None:
     emb_dir = out_dir / "embeddings"
     emb_dir.mkdir(parents=True, exist_ok=True)
     patch_xyxy = np.asarray([[p.x0, p.y0, p.x1, p.y1] for p in patches], dtype=np.int32)
+
+    # Build per-patch cell_index array so we can map patches back to cells
+    cell_index = np.zeros(len(patches), dtype=np.int32)
+    if cells is not None:
+        idx = 0
+        for ci, cell in enumerate(cells):
+            for _ in cell.patches:
+                if idx < len(patches):
+                    cell_index[idx] = ci
+                idx += 1
+
     save_path = emb_dir / f"image_{shown_idx:02d}.npz"
-    if emb_pca is None:
-        np.savez_compressed(
-            save_path,
-            image_path=str(image_path),
-            patch_xyxy=patch_xyxy,
-            emb_raw=emb_raw.astype(np.float32, copy=False),
-            labels=labels.astype(np.int64, copy=False),
-        )
-    else:
-        np.savez_compressed(
-            save_path,
-            image_path=str(image_path),
-            patch_xyxy=patch_xyxy,
-            emb_raw=emb_raw.astype(np.float32, copy=False),
-            emb_pca=emb_pca.astype(np.float32, copy=False),
-            labels=labels.astype(np.int64, copy=False),
-        )
+    save_kwargs = dict(
+        image_path=str(image_path),
+        patch_xyxy=patch_xyxy,
+        emb_raw=emb_raw.astype(np.float32, copy=False),
+        labels=labels.astype(np.int64, copy=False),
+        cell_index=cell_index,
+    )
+    if emb_pca is not None:
+        save_kwargs["emb_pca"] = emb_pca.astype(np.float32, copy=False)
+    if cells is not None:
+        # Store cell boundaries
+        cell_xyxy = np.asarray([[c.x0, c.y0, c.x1, c.y1] for c in cells], dtype=np.int32)
+        save_kwargs["cell_xyxy"] = cell_xyxy
+    np.savez_compressed(save_path, **save_kwargs)
 
 
 def _weights_fingerprint(weights_path: str) -> Tuple[Optional[float], Optional[int]]:
@@ -751,13 +902,16 @@ def _patches_fingerprint(patches: List[Patch]) -> str:
     return hashlib.sha1(arr.tobytes()).hexdigest()
 
 
-def _cache_key(*, image_path: Path, embedder_name: str, max_edge: int, pad_size: int, weights_path: str, patches_fp: str) -> str:
+def _cache_key(*, image_path: Path, embedder_name: str, grid_size: int,
+               weights_path: str, patches_fp: str,
+               cell_row: int, cell_col: int) -> str:
     mtime, fsize = _weights_fingerprint(weights_path)
     payload = {
         "image": str(image_path),
         "embedder": str(embedder_name),
-        "max_edge": int(max_edge),
-        "pad_size": int(pad_size),
+        "grid_size": int(grid_size),
+        "cell_row": int(cell_row),
+        "cell_col": int(cell_col),
         "weights_path": str(weights_path),
         "weights_mtime": mtime,
         "weights_size": fsize,
@@ -771,20 +925,20 @@ def _compute_cache_path(
     cache_dir: Path,
     image_path: Path,
     embedder_name: str,
-    max_edge: int,
-    pad_size: int,
-    patches: List[Patch],
+    grid_size: int,
+    cell: GridCell,
     weights_path: str,
 ) -> Path:
-    """Compute the cache file path for an image's embeddings."""
-    patches_fp = _patches_fingerprint(patches)
+    """Compute the cache file path for a single grid cell's embeddings."""
+    patches_fp = _patches_fingerprint(cell.patches)
     key = _cache_key(
         image_path=image_path,
         embedder_name=embedder_name,
-        max_edge=max_edge,
-        pad_size=pad_size,
+        grid_size=grid_size,
         weights_path=weights_path,
         patches_fp=patches_fp,
+        cell_row=cell.row,
+        cell_col=cell.col,
     )
     return cache_dir / f"{key}.npz"
 
@@ -800,63 +954,65 @@ def _load_cached_embeddings(fpath: Path) -> Optional[np.ndarray]:
         return None
 
 
-def _save_embeddings_to_cache(fpath: Path, emb: np.ndarray, image_path: Path) -> None:
-    """Save embeddings to cache file (uncompressed for speed)."""
+def _save_embeddings_to_cache(fpath: Path, emb: np.ndarray, image_path: Path,
+                              cell_row: int = 0, cell_col: int = 0) -> None:
+    """Save embeddings for one grid cell to cache file (uncompressed for speed)."""
+    if np.any(np.isnan(emb)):
+        raise RuntimeError(
+            f"Refusing to cache NaN embeddings for {image_path} "
+            f"(cell row={cell_row} col={cell_col}, path={fpath}). "
+            f"{int(np.isnan(emb).sum())}/{emb.size} values are NaN."
+        )
     fpath.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
         fpath,
         emb=emb.astype(np.float16, copy=False),
         image_path=str(image_path),
+        cell_row=cell_row,
+        cell_col=cell_col,
     )
 
 
 @dataclass
-class _PendingImage:
-    """Tracks an image waiting for its patches to be embedded."""
+class _PendingCell:
+    """Tracks a single grid cell waiting for its patches to be embedded."""
     image_path: Path
     img_tensor: torch.Tensor
-    patches: List[Patch]
+    cell: GridCell
     cache_path: Path
-    start_idx: int  # index into the global batch where this image's patches start
     num_patches: int
 
 
 class MultiImageBatchedEmbedder:
-    """Batches patches across multiple images for efficient GPU utilization.
+    """Batches patches across multiple grid cells for efficient GPU utilization.
 
-    Instead of embedding one image (e.g., 225 patches) at a time, this class
-    accumulates patches from multiple images until batch_size is reached,
-    then runs a single forward pass and caches results per-image.
-
-    This allows proper utilization of large batch sizes (e.g., 2048) by
-    processing patches from ~9 images in one GPU forward pass.
+    Grid cells from multiple images are accumulated until *batch_size* patches
+    are queued, then a single forward pass embeds them all.  Results are cached
+    **per grid cell** — one ``.npz`` file per 512×512 cell.
     """
 
     def __init__(
         self,
         embedder: "DinoV3SatViTL16Embedder",
         cache_dir: Path,
-        max_edge: int,
-        pad_size: int,
+        grid_size: int,
         weights_path: str,
         batch_size: int,
         gpu_batch_size: int = 512,
     ):
         self.embedder = embedder
         self.cache_dir = cache_dir
-        self.max_edge = max_edge
-        self.pad_size = pad_size
+        self.grid_size = grid_size
         self.weights_path = weights_path
         self.batch_size = batch_size
         self.gpu_batch_size = gpu_batch_size
 
-        # Accumulated patches waiting to be embedded
-        self._pending_images: List[_PendingImage] = []
-        self._pending_tensors: List[torch.Tensor] = []  # individual patch tensors
+        # Accumulated cells waiting to be embedded
+        self._pending_cells: List[_PendingCell] = []
         self._total_pending: int = 0
 
         # Stats
-        self.images_processed = 0
+        self.cells_processed = 0
         self.patches_embedded = 0
         self.forward_passes = 0
 
@@ -864,35 +1020,37 @@ class MultiImageBatchedEmbedder:
         self,
         image_path: Path,
         img_tensor: torch.Tensor,
-        patches: List[Patch],
+        cells: List[GridCell],
     ) -> None:
-        """Add an image's patches to the buffer. May trigger embedding if buffer is full."""
-        cache_path = _compute_cache_path(
-            self.cache_dir,
-            image_path,
-            self.embedder.name,
-            self.max_edge,
-            self.pad_size,
-            patches,
-            self.weights_path,
-        )
+        """Add all grid cells of an image to the buffer.
 
-        # Skip if already cached
-        if cache_path.exists():
-            self.images_processed += 1
-            return
+        Each cell is checked for a cache hit individually; only uncached
+        cells are queued for embedding.
+        """
+        for cell in cells:
+            cache_path = _compute_cache_path(
+                self.cache_dir,
+                image_path,
+                self.embedder.name,
+                self.grid_size,
+                cell,
+                self.weights_path,
+            )
 
-        # Add to pending buffer
-        pending = _PendingImage(
-            image_path=image_path,
-            img_tensor=img_tensor,
-            patches=patches,
-            cache_path=cache_path,
-            start_idx=self._total_pending,
-            num_patches=len(patches),
-        )
-        self._pending_images.append(pending)
-        self._total_pending += len(patches)
+            # Skip if already cached
+            if cache_path.exists():
+                self.cells_processed += 1
+                continue
+
+            pending = _PendingCell(
+                image_path=image_path,
+                img_tensor=img_tensor,
+                cell=cell,
+                cache_path=cache_path,
+                num_patches=len(cell.patches),
+            )
+            self._pending_cells.append(pending)
+            self._total_pending += len(cell.patches)
 
         # Flush if we've accumulated enough patches
         while self._total_pending >= self.batch_size:
@@ -900,58 +1058,58 @@ class MultiImageBatchedEmbedder:
 
     def flush(self) -> None:
         """Process any remaining patches in the buffer."""
-        while self._pending_images:
+        while self._pending_cells:
             self._flush_batch()
 
     def _flush_batch(self) -> None:
-        """Embed one batch worth of patches and cache results."""
-        if not self._pending_images:
+        """Embed one batch worth of patches and cache results per grid cell."""
+        if not self._pending_cells:
             return
 
-        # Collect patches up to batch_size
-        patches_to_embed: List[Tuple[torch.Tensor, int, int, int, int]] = []  # (tensor slice args)
-        images_in_batch: List[_PendingImage] = []
+        cells_in_batch: List[_PendingCell] = []
         batch_count = 0
 
-        # Determine which images fit in this batch
-        remaining_pending: List[_PendingImage] = []
-        for pending in self._pending_images:
+        # Greedily pack cells into this batch
+        remaining: List[_PendingCell] = []
+        for pending in self._pending_cells:
             if batch_count + pending.num_patches <= self.batch_size or batch_count == 0:
-                # Include this image (always include at least one image even if > batch_size)
-                images_in_batch.append(pending)
+                cells_in_batch.append(pending)
                 batch_count += pending.num_patches
             else:
-                remaining_pending.append(pending)
-        self._pending_images = remaining_pending
+                remaining.append(pending)
+        self._pending_cells = remaining
 
-        if not images_in_batch:
+        if not cells_in_batch:
             return
 
-        # Pre-allocate crop buffer to avoid torch.stack allocation overhead
-        p0 = images_in_batch[0].patches[0]
+        # Pre-allocate crop buffer
+        p0 = cells_in_batch[0].cell.patches[0]
         patch_h = p0.y1 - p0.y0
         patch_w = p0.x1 - p0.x0
         crops_tensor = torch.empty(batch_count, 3, patch_h, patch_w, dtype=torch.float32)
         offset = 0
-        for img_info in images_in_batch:
-            for p in img_info.patches:
-                crops_tensor[offset] = img_info.img_tensor[:, p.y0:p.y1, p.x0:p.x1]
+        for cell_info in cells_in_batch:
+            for p in cell_info.cell.patches:
+                crops_tensor[offset] = cell_info.img_tensor[:, p.y0:p.y1, p.x0:p.x1]
                 offset += 1
 
         embeddings = self._embed_batch(crops_tensor)  # (N, D)
 
-        # Distribute embeddings back to their source images and cache
+        # Distribute embeddings back to their source cells and cache per-cell
         offset = 0
-        for img_info in images_in_batch:
-            n = img_info.num_patches
-            img_emb = embeddings[offset : offset + n]
-            _save_embeddings_to_cache(img_info.cache_path, img_emb, img_info.image_path)
+        for cell_info in cells_in_batch:
+            n = cell_info.num_patches
+            cell_emb = embeddings[offset : offset + n]
+            _save_embeddings_to_cache(
+                cell_info.cache_path, cell_emb, cell_info.image_path,
+                cell_row=cell_info.cell.row, cell_col=cell_info.cell.col,
+            )
             offset += n
-            self.images_processed += 1
+            self.cells_processed += 1
 
         self.patches_embedded += batch_count
         self.forward_passes += 1
-        self._total_pending = sum(p.num_patches for p in self._pending_images)
+        self._total_pending = sum(c.num_patches for c in self._pending_cells)
 
     @torch.inference_mode()
     def _embed_batch(self, crops: torch.Tensor) -> np.ndarray:
@@ -962,6 +1120,7 @@ class MultiImageBatchedEmbedder:
         - Pinned memory for async CPU→GPU transfer
         - Double-buffered CUDA streams: the next sub-batch is transferred
           while the current sub-batch is being computed
+        - No resize to 224: patches fed at native resolution (RoPE handles it)
         """
         device = self.embedder.device
         mean = self.embedder._IMAGENET_MEAN.to(device)
@@ -998,22 +1157,31 @@ class MultiImageBatchedEmbedder:
                         next_end = min(next_start + sub_batch_size, n)
                         next_batch = crops[next_start:next_end].to(device, non_blocking=True)
 
-                # Compute: resize → normalize → model forward (fp16)
-                batch = F.interpolate(batch, size=(224, 224), mode="bicubic", align_corners=False)
+                # Compute: normalize → model forward (fp16), no resize
                 batch = (batch - mean) / std
                 with torch.cuda.amp.autocast(enabled=True):
-                    embs = self.embedder.model(batch)
+                    cls_emb, patch_embs = self.embedder.model(batch)
+                embs = self.embedder._pool(cls_emb, patch_embs)
                 all_embs.append(embs.float().cpu())
         else:
             # CPU fallback (no streams, no autocast)
             for i in range(0, crops.shape[0], sub_batch_size):
                 batch = crops[i : i + sub_batch_size].to(device)
-                batch = F.interpolate(batch, size=(224, 224), mode="bicubic", align_corners=False)
                 batch = (batch - mean) / std
-                embs = self.embedder.model(batch)
+                cls_emb, patch_embs = self.embedder.model(batch)
+                embs = self.embedder._pool(cls_emb, patch_embs)
                 all_embs.append(embs.cpu())
 
-        return torch.cat(all_embs, dim=0).numpy().astype(np.float32)
+        result = torch.cat(all_embs, dim=0).numpy().astype(np.float32)
+        if np.any(np.isnan(result)):
+            nan_count = int(np.isnan(result).sum())
+            raise RuntimeError(
+                f"NaN detected in embeddings immediately after model forward pass! "
+                f"{nan_count}/{result.size} values are NaN. "
+                f"This indicates the fp16 overflow fix in _Attention.forward() is not working. "
+                f"Check that torch.cuda.amp.autocast(enabled=False) wraps the attention matmul."
+            )
+        return result
 
 # ---------------------------------------------------------------------------
 # Threaded prefetch loader: keeps GPU fed by loading images ahead of time
@@ -1065,8 +1233,8 @@ def _embed_images_batched(
     *,
     image_paths: List[Path],
     embedder: Embedder,
-    max_edge: int,
-    pad_size: int,
+    grid_size: int,
+    large_size: int,
     small_size: int,
     small_stride_x: int,
     small_stride_y: int,
@@ -1076,36 +1244,39 @@ def _embed_images_batched(
     cache_dir: Path,
     use_cache: bool,
     device: str,
-) -> Tuple[List[np.ndarray], List[List[Patch]]]:
+) -> Tuple[List[List[np.ndarray]], List[List[GridCell]]]:
     """Embed patches from multiple images with cross-image batching + threaded loading.
 
-    Optimizations over the baseline implementation:
-    - Threaded image loading (4 workers, 16-item prefetch) keeps GPU fed
-    - Uses tensor-based cropping & MultiImageBatchedEmbedder for cross-image batching
-    - All downstream optimizations (fp16, pinned memory, CUDA streams) apply automatically
+    Images are resized to multiples of *grid_size*, then small patches are
+    extracted within each non-overlapping *large_size* x *large_size* cell.
+    Each grid cell is embedded and cached **independently**.
 
     Returns:
-        Tuple of (list of embeddings per image, list of patches per image)
+        Tuple of:
+            - per-image list of per-cell embedding arrays: ``List[List[np.ndarray]]``
+              where ``result[i][j]`` is shape ``(n_patches_in_cell, D)``
+            - per-image list of GridCell objects: ``List[List[GridCell]]``
     """
-    all_embeddings: List[Optional[np.ndarray]] = []
-    all_patches: List[List[Patch]] = []
+    # Per-image outputs
+    all_cell_embeddings: List[List[Optional[np.ndarray]]] = []
+    all_cells: List[List[GridCell]] = []
     use_tensor_fast = isinstance(embedder, DinoV3SatViTL16Embedder)
 
-    # First pass: threaded loading + cache check
-    pending_items: List[Tuple[int, Path, List[Patch], torch.Tensor]] = []
+    # Track which (image_idx, cell_idx) pairs still need embedding
+    pending_items: List[Tuple[int, Path, List[GridCell], torch.Tensor]] = []
 
     def _load_one_image(idx_and_path):
         idx, img_path = idx_and_path
-        img = _load_and_standardize_image(img_path, max_edge=max_edge, pad_size=pad_size)
+        img = _load_and_standardize_image(img_path, grid_size=grid_size)
         w, h = img.size
-        patches = _extract_sliding_window_patches(
+        cells = _extract_patches_in_grid(
             w, h,
-            patch_w=small_size, patch_h=small_size,
-            stride_x=small_stride_x, stride_y=small_stride_y,
+            large_size=large_size,
+            small_size=small_size,
+            small_stride_x=small_stride_x, small_stride_y=small_stride_y,
         )
-        # Pre-convert to tensor once (avoids repeated PIL→numpy→tensor later)
         img_t = torch.from_numpy(np.asarray(img)).permute(2, 0, 1).float().div_(255.0)
-        return idx, img_path, patches, img_t
+        return idx, img_path, cells, img_t
 
     print(f"[Batched] Loading images with threaded prefetch ({len(image_paths)} images, 4 workers)...")
     prefetcher = _PrefetchLoader(
@@ -1114,162 +1285,122 @@ def _embed_images_batched(
         num_workers=4,
         prefetch_count=16,
     )
-    for idx, img_path, patches, img_t in tqdm(prefetcher, desc="Scanning images", total=len(image_paths)):
-        all_patches.append(patches)
 
-        # Check cache
+    for idx, img_path, cells, img_t in tqdm(prefetcher, desc="Scanning images", total=len(image_paths)):
+        all_cells.append(cells)
+
+        # Try loading each cell from cache
+        cell_embs: List[Optional[np.ndarray]] = []
+        any_missing = False
         if use_cache:
-            cache_path = _compute_cache_path(
-                cache_dir=cache_dir,
-                image_path=img_path,
-                embedder_name=embedder.name,
-                max_edge=max_edge,
-                pad_size=pad_size,
-                patches=patches,
-                weights_path=weights_path,
-            )
-            cached = _load_cached_embeddings(cache_path)
-            if cached is not None and cached.shape[0] == len(patches):
-                all_embeddings.append(cached)
-                continue
+            for cell in cells:
+                cache_path = _compute_cache_path(
+                    cache_dir=cache_dir,
+                    image_path=img_path,
+                    embedder_name=embedder.name,
+                    grid_size=grid_size,
+                    cell=cell,
+                    weights_path=weights_path,
+                )
+                cached = _load_cached_embeddings(cache_path)
+                if cached is not None and cached.shape[0] == len(cell.patches):
+                    cell_embs.append(cached)
+                else:
+                    cell_embs.append(None)
+                    any_missing = True
+        else:
+            cell_embs = [None] * len(cells)
+            any_missing = True
 
-        # Not cached - need to compute
-        pending_items.append((idx, img_path, patches, img_t))
-        all_embeddings.append(None)  # Placeholder
+        all_cell_embeddings.append(cell_embs)
+        if any_missing:
+            pending_items.append((idx, img_path, cells, img_t))
 
     if not pending_items:
-        print(f"[Batched] All {len(image_paths)} images found in cache!")
-        return all_embeddings, all_patches
+        print(f"[Batched] All {len(image_paths)} images ({sum(len(c) for c in all_cells)} cells) found in cache!")
+        return all_cell_embeddings, all_cells
 
-    total_pending_patches = sum(len(p[2]) for p in pending_items)
-    print(f"[Batched] Need to embed {len(pending_items)} images ({total_pending_patches} total patches)")
+    total_pending_cells = sum(
+        sum(1 for e in all_cell_embeddings[idx] if e is None)
+        for idx, _, _, _ in pending_items
+    )
+    total_pending_patches = sum(
+        sum(len(cell.patches) for cell, emb in zip(cells, all_cell_embeddings[idx]) if emb is None)
+        for idx, _, cells, _ in pending_items
+    )
+    print(f"[Batched] Need to embed {total_pending_cells} cells ({total_pending_patches} patches) "
+          f"from {len(pending_items)} images")
 
-    # Second pass: embed using cross-image batching with MultiImageBatchedEmbedder
+    # Second pass: embed uncached cells
     if use_tensor_fast:
         cache_dir_path = Path(cache_dir) if not isinstance(cache_dir, Path) else cache_dir
         batched = MultiImageBatchedEmbedder(
             embedder=embedder,
             cache_dir=cache_dir_path,
-            max_edge=max_edge,
-            pad_size=pad_size,
+            grid_size=grid_size,
             weights_path=weights_path,
             batch_size=embed_batch,
             gpu_batch_size=gpu_batch_size,
         )
-        for orig_idx, img_path, patches, img_t in tqdm(pending_items, desc="Embedding images"):
-            batched.add_image(image_path=img_path, img_tensor=img_t, patches=patches)
+        for orig_idx, img_path, cells, img_t in tqdm(pending_items, desc="Embedding cells"):
+            # Only submit cells that aren't cached yet
+            uncached_cells = [
+                cell for cell, emb in zip(cells, all_cell_embeddings[orig_idx])
+                if emb is None
+            ]
+            if uncached_cells:
+                batched.add_image(image_path=img_path, img_tensor=img_t, cells=uncached_cells)
         batched.flush()
 
-        # Read back results from cache
-        for orig_idx, img_path, patches, img_t in pending_items:
-            cache_path = _compute_cache_path(
-                cache_dir=cache_dir_path,
-                image_path=img_path,
-                embedder_name=embedder.name,
-                max_edge=max_edge,
-                pad_size=pad_size,
-                patches=patches,
-                weights_path=weights_path,
-            )
-            cached = _load_cached_embeddings(cache_path)
-            if cached is not None:
-                all_embeddings[orig_idx] = cached
-            else:
-                # Fallback: embed single image directly
-                emb = embedder.embed_tensor_patches(img_t, patches, batch_size=gpu_batch_size)
-                all_embeddings[orig_idx] = emb.numpy().astype(np.float32)
-    else:
-        # PIL-based fallback for non-DINOv3 embedders
-        for orig_idx, img_path, patches, img_t in tqdm(pending_items, desc="Embedding images (PIL)"):
-            img_np = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
-            pil_img = Image.fromarray(img_np)
-            patch_imgs = [_crop(pil_img, p) for p in patches]
-            emb = embedder.embed_pil(patch_imgs, batch_size=gpu_batch_size)
-            emb_array = emb.numpy().astype(np.float32)
-
-            if use_cache:
+        # Read back results from per-cell cache
+        for orig_idx, img_path, cells, img_t in pending_items:
+            for ci, cell in enumerate(cells):
+                if all_cell_embeddings[orig_idx][ci] is not None:
+                    continue  # already had it
                 cache_path = _compute_cache_path(
-                    cache_dir=cache_dir,
+                    cache_dir=cache_dir_path,
                     image_path=img_path,
                     embedder_name=embedder.name,
-                    max_edge=max_edge,
-                    pad_size=pad_size,
-                    patches=patches,
+                    grid_size=grid_size,
+                    cell=cell,
                     weights_path=weights_path,
                 )
-                _save_embeddings_to_cache(cache_path, emb_array, img_path)
+                cached = _load_cached_embeddings(cache_path)
+                if cached is not None:
+                    all_cell_embeddings[orig_idx][ci] = cached
+                else:
+                    # Fallback: embed this cell directly
+                    flat_patches = cell.patches
+                    emb = embedder.embed_tensor_patches(img_t, flat_patches, batch_size=gpu_batch_size)
+                    all_cell_embeddings[orig_idx][ci] = emb.numpy().astype(np.float32)
+    else:
+        # PIL-based fallback for non-DINOv3 embedders
+        for orig_idx, img_path, cells, img_t in tqdm(pending_items, desc="Embedding cells (PIL)"):
+            img_np = (img_t.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            pil_img = Image.fromarray(img_np)
+            for ci, cell in enumerate(cells):
+                if all_cell_embeddings[orig_idx][ci] is not None:
+                    continue
+                patch_imgs = [_crop(pil_img, p) for p in cell.patches]
+                emb = embedder.embed_pil(patch_imgs, batch_size=gpu_batch_size)
+                emb_array = emb.numpy().astype(np.float32)
 
-            all_embeddings[orig_idx] = emb_array
+                if use_cache:
+                    cache_path = _compute_cache_path(
+                        cache_dir=cache_dir,
+                        image_path=img_path,
+                        embedder_name=embedder.name,
+                        grid_size=grid_size,
+                        cell=cell,
+                        weights_path=weights_path,
+                    )
+                    _save_embeddings_to_cache(
+                        cache_path, emb_array, img_path,
+                        cell_row=cell.row, cell_col=cell.col,
+                    )
+                all_cell_embeddings[orig_idx][ci] = emb_array
 
-    return all_embeddings, all_patches
-
-def _get_or_compute_embeddings_cached(
-    *,
-    cache_dir: Path,
-    image_path: Path,
-    embedder: Embedder,
-    max_edge: int,
-    pad_size: int,
-    patches: List[Patch],
-    patch_images: Optional[List[Image.Image]] = None,
-    img_tensor: Optional[torch.Tensor] = None,
-    embed_batch: int,
-    weights_path: str,
-    cache: bool,
-) -> np.ndarray:
-    """Compute (or load cached) patch embeddings.
-
-    Fast path: if *img_tensor* is provided and the embedder is
-    DinoV3SatViTL16Embedder, we use tensor-based cropping and GPU-batched
-    resize/normalize — avoiding 225 individual PIL crops per image.
-    """
-    use_tensor_fast = (
-        img_tensor is not None
-        and isinstance(embedder, DinoV3SatViTL16Embedder)
-    )
-
-    def _embed() -> np.ndarray:
-        if use_tensor_fast:
-            return embedder.embed_tensor_patches(
-                img_tensor, patches, batch_size=embed_batch
-            ).numpy().astype(np.float32)
-        else:
-            if patch_images is None:
-                raise ValueError("patch_images required when tensor fast path is unavailable")
-            return embedder.embed_pil(
-                patch_images, batch_size=embed_batch
-            ).numpy().astype(np.float32)
-
-    if not cache:
-        return _embed()
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    patches_fp = _patches_fingerprint(patches)
-    key = _cache_key(
-        image_path=image_path,
-        embedder_name=embedder.name,
-        max_edge=max_edge,
-        pad_size=pad_size,
-        weights_path=weights_path,
-        patches_fp=patches_fp,
-    )
-    fpath = cache_dir / f"{key}.npz"
-
-    if fpath.exists():
-        try:
-            data = np.load(fpath, allow_pickle=False)
-            emb = data["emb"].astype(np.float32, copy=False)
-            return emb
-        except Exception:
-            pass
-
-    emb = _embed()
-    np.savez(
-        fpath,
-        emb=emb.astype(np.float16, copy=False),
-        image_path=str(image_path),
-    )
-    return emb
+    return all_cell_embeddings, all_cells
 
 
 def main() -> int:
@@ -1282,9 +1413,6 @@ def main() -> int:
 
     parser.add_argument("--cluster-num-images", type=int, default=1000)
     parser.add_argument("--viz-num-images", type=int, default=25)
-    parser.add_argument("--max-edge", type=int, default=1024)
-    parser.add_argument("--pad-size", type=int, default=1024)
-
     parser.add_argument("--large-size", type=int, default=512)
     parser.add_argument("--large-stride", type=int, default=512,
                         help="Uniform large-patch stride (overridden by --large-stride-x/y)")
@@ -1314,6 +1442,16 @@ def main() -> int:
     parser.add_argument("--save-embeddings", action="store_true")
     parser.add_argument("--cache-embeddings", action="store_true")
     parser.add_argument("--cache-dir", type=str, default="outputs/preprocess_cache_dinov3")
+
+    parser.add_argument(
+        "--pool-mode",
+        type=str,
+        default="cls_avg",
+        choices=["cls", "avg", "cls_avg"],
+        help="Embedding pooling mode: 'cls' (CLS token, 1024-d), "
+             "'avg' (mean of patch tokens, 1024-d), "
+             "'cls_avg' (concat CLS + mean patch, 2048-d, default).",
+    )
 
     parser.add_argument(
         "--clusterer",
@@ -1424,33 +1562,27 @@ def main() -> int:
     viz_set = set(cluster_paths[:viz_n])
 
     # Embedder
-    embedder = DinoV3SatViTL16Embedder(device=args.device, weights_path=args.weights_path)
+    embedder = DinoV3SatViTL16Embedder(device=args.device, weights_path=args.weights_path, pool_mode=args.pool_mode)
 
-    def iter_small_patches_for_image(
+    def iter_cells_for_image(
         img: Image.Image,
-    ) -> Tuple[List[Patch], Optional[List[Image.Image]], torch.Tensor]:
-        """Return (patches, optional PIL crops, image tensor).
+    ) -> Tuple[List[GridCell], torch.Tensor]:
+        """Return (grid_cells, image_tensor) for an image.
 
-        The image tensor is always returned for the fast embedding path.
-        PIL crops are only created when the embedder does NOT support the
-        tensor fast path (non-DINOv3), to avoid CPU overhead.
+        Each :class:`GridCell` contains the small patches confined to that
+        512×512 cell.  The image tensor is always returned for the fast
+        embedding path.
         """
         pw, ph = img.size
-        if pw != args.pad_size or ph != args.pad_size:
-            raise RuntimeError("Expected padded image")
-        small_patches_full = _extract_sliding_window_patches(
+        cells = _extract_patches_in_grid(
             pw, ph,
-            patch_w=args.small_size, patch_h=args.small_size,
-            stride_x=args.small_stride_x, stride_y=args.small_stride_y,
+            large_size=args.large_size,
+            small_size=args.small_size,
+            small_stride_x=args.small_stride_x,
+            small_stride_y=args.small_stride_y,
         )
-        # Convert image to tensor once — used by the fast embedding path
         img_t = torch.from_numpy(np.asarray(img)).permute(2, 0, 1).float().div_(255.0)
-        # Only create PIL crops if the embedder doesn't support tensor patches
-        if isinstance(embedder, DinoV3SatViTL16Embedder):
-            small_imgs = None  # not needed — tensor slicing is used instead
-        else:
-            small_imgs = [_crop(img, sp) for sp in small_patches_full]
-        return small_patches_full, small_imgs, img_t
+        return cells, img_t
 
     # ---------------------------------------------------------------
     # Multi-GPU embed-only mode: cache embeddings for a shard, then exit.
@@ -1469,21 +1601,19 @@ def main() -> int:
         batched_embedder = MultiImageBatchedEmbedder(
             embedder=embedder,
             cache_dir=cache_dir,
-            max_edge=args.max_edge,
-            pad_size=args.pad_size,
+            grid_size=args.large_size,
             weights_path=args.weights_path,
             batch_size=args.embed_batch,
             gpu_batch_size=args.gpu_batch_size,
         )
 
         # Threaded prefetch: load+preprocess images in a thread pool while
-        # the main thread feeds patches to the GPU.  This eliminates the
-        # "GPU idle while CPU loads next image" bottleneck.
+        # the main thread feeds patches to the GPU.
         def _load_and_prepare_image(p: Path):
-            """Load + standardize + extract patches (runs in thread pool)."""
-            img = _load_and_standardize_image(p, max_edge=args.max_edge, pad_size=args.pad_size)
-            small_patches_full, _small_imgs, img_t = iter_small_patches_for_image(img)
-            return p, small_patches_full, img_t
+            """Load + standardize + extract cells (runs in thread pool)."""
+            img = _load_and_standardize_image(p, grid_size=args.large_size)
+            cells, img_t = iter_cells_for_image(img)
+            return p, cells, img_t
 
         prefetcher = _PrefetchLoader(
             shard_paths,
@@ -1491,7 +1621,7 @@ def main() -> int:
             num_workers=4,
             prefetch_count=16,
         )
-        for p, small_patches_full, img_t in tqdm(
+        for p, cells, img_t in tqdm(
             prefetcher,
             desc=f"[Shard {args.shard_index}] Embedding images",
             unit="img",
@@ -1501,14 +1631,14 @@ def main() -> int:
             batched_embedder.add_image(
                 image_path=p,
                 img_tensor=img_t,
-                patches=small_patches_full,
+                cells=cells,
             )
 
         # Flush any remaining patches
         batched_embedder.flush()
 
         print(f"[Shard {args.shard_index}] Embedding complete. "
-              f"Images: {batched_embedder.images_processed}, "
+              f"Cells: {batched_embedder.cells_processed}, "
               f"Patches: {batched_embedder.patches_embedded}, "
               f"Forward passes: {batched_embedder.forward_passes}", flush=True)
         print(f"[Shard {args.shard_index}] Cache dir: {cache_dir}", flush=True)
@@ -1520,17 +1650,18 @@ def main() -> int:
 
     # ---------------------------------------------------------------
     # Pre-compute all embeddings using cross-image batching
-    # This populates the cache so subsequent per-image lookups are fast
+    # This populates the cache so subsequent per-image lookups are fast.
+    # Results are per-cell: one .npz cache file per 512×512 grid cell.
     # ---------------------------------------------------------------
     print(f"\n=== Pre-embedding {len(cluster_paths)} images with cross-image batching ===")
     print(f"    embed_batch={args.embed_batch} (patches accumulated), "
           f"gpu_batch_size={args.gpu_batch_size} (patches per forward pass)")
     
-    all_embeddings, all_patches = _embed_images_batched(
+    all_cell_embeddings, all_cells = _embed_images_batched(
         image_paths=cluster_paths,
         embedder=embedder,
-        max_edge=args.max_edge,
-        pad_size=args.pad_size,
+        grid_size=args.large_size,
+        large_size=args.large_size,
         small_size=args.small_size,
         small_stride_x=args.small_stride_x,
         small_stride_y=args.small_stride_y,
@@ -1542,16 +1673,26 @@ def main() -> int:
         device=args.device,
     )
     
-    # Create a lookup dict for fast access during clustering/viz
-    embeddings_by_path: Dict[Path, np.ndarray] = {
-        p: emb for p, emb in zip(cluster_paths, all_embeddings) if emb is not None
-    }
-    patches_by_path: Dict[Path, List[Patch]] = {
-        p: patches for p, patches in zip(cluster_paths, all_patches)
-    }
+    # Build per-image lookup dicts by concatenating per-cell data.
+    # embeddings_by_path[img] = (N_total_small_patches, D) — all cells concatenated
+    # cells_by_path[img] = List[GridCell] — for per-cell access later
+    # patches_by_path[img] = flat List[Patch] — for colorization / viz
+    embeddings_by_path: Dict[Path, np.ndarray] = {}
+    cells_by_path: Dict[Path, List[GridCell]] = {}
+    cell_embeddings_by_path: Dict[Path, List[np.ndarray]] = {}
+    patches_by_path: Dict[Path, List[Patch]] = {}
+    for p, cell_embs, cells in zip(cluster_paths, all_cell_embeddings, all_cells):
+        valid_embs = [e for e in cell_embs if e is not None]
+        if valid_embs:
+            embeddings_by_path[p] = np.concatenate(valid_embs, axis=0)
+        cells_by_path[p] = cells
+        cell_embeddings_by_path[p] = cell_embs  # per-cell list
+        patches_by_path[p] = _flatten_cells(cells)  # flat list for viz
     
-    total_patches = sum(len(p) for p in all_patches)
-    print(f"=== Pre-embedding complete: {len(cluster_paths)} images, {total_patches} total patches ===\n")
+    total_cells = sum(len(c) for c in all_cells)
+    total_patches = sum(len(patches_by_path.get(p, [])) for p in cluster_paths)
+    print(f"=== Pre-embedding complete: {len(cluster_paths)} images, "
+          f"{total_cells} grid cells, {total_patches} total patches ===\n")
 
     # ---------------------------------------------------------------
     # Clustering
@@ -1641,7 +1782,7 @@ def main() -> int:
             if p not in viz_set or shown >= viz_n:
                 continue
 
-            img = _load_and_standardize_image(p, max_edge=args.max_edge, pad_size=args.pad_size)
+            img = _load_and_standardize_image(p, grid_size=args.large_size)
             small_patches_full = patches_by_path.get(p, [])
 
             # Use pre-computed embeddings
@@ -1665,11 +1806,12 @@ def main() -> int:
                     pred_labels[noise_mask] = nn.astype(np.int64)
 
             if args.save_embeddings:
-                _save_viz_embeddings(out_dir, shown, p, small_patches_full, embs_all, pred_labels, emb_pca=embs_pca)
+                _save_viz_embeddings(out_dir, shown, p, small_patches_full, embs_all, pred_labels,
+                                     cells=cells_by_path.get(p), emb_pca=embs_pca)
 
             fig, axs = plt.subplots(1, 3, figsize=(16, 6))
             axs[0].imshow(img)
-            axs[0].set_title("Standardized image (resized + padded)")
+            axs[0].set_title("Standardized image (resized to grid)")
             axs[0].axis("off")
 
             axs[1].imshow(img)
@@ -1733,11 +1875,10 @@ def main() -> int:
             image_paths=image_paths_str,
             patches_per_image=patches_per_image,
             pca_dim=int(args.pca_dim),
-            pad_size=int(args.pad_size),
+            grid_size=int(args.large_size),
             small_size=int(args.small_size),
             small_stride_x=int(args.small_stride_x),
             small_stride_y=int(args.small_stride_y),
-            max_edge=int(args.max_edge),
         )
         print(f"Saved embedding data for CPU sweep: {sweep_path} ({X_pca.shape})")
         # ---- also save PCA model ----
@@ -1775,7 +1916,7 @@ def main() -> int:
             if p not in viz_set or shown >= viz_n:
                 continue
 
-            img = _load_and_standardize_image(p, max_edge=args.max_edge, pad_size=args.pad_size)
+            img = _load_and_standardize_image(p, grid_size=args.large_size)
             small_patches_full = patches_by_path.get(p, [])
 
             # Use pre-computed embeddings
@@ -1788,11 +1929,12 @@ def main() -> int:
             pred_labels = model.predict(embs_pca)
 
             if args.save_embeddings:
-                _save_viz_embeddings(out_dir, shown, p, small_patches_full, embs_all, pred_labels, emb_pca=embs_pca)
+                _save_viz_embeddings(out_dir, shown, p, small_patches_full, embs_all, pred_labels,
+                                     cells=cells_by_path.get(p), emb_pca=embs_pca)
 
             fig, axs = plt.subplots(1, 3, figsize=(16, 6))
             axs[0].imshow(img)
-            axs[0].set_title("Standardized image (resized + padded)")
+            axs[0].set_title("Standardized image (resized to grid)")
             axs[0].axis("off")
 
             axs[1].imshow(img)
@@ -1838,8 +1980,7 @@ def main() -> int:
         "split": args.split,
         "cluster_num_images": int(cluster_n),
         "viz_num_images": int(viz_n),
-        "max_edge": int(args.max_edge),
-        "pad_size": int(args.pad_size),
+        "grid_size": int(args.large_size),
         "small_size": int(args.small_size),
         "small_stride_x": int(args.small_stride_x),
         "small_stride_y": int(args.small_stride_y),

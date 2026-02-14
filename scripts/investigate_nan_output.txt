@@ -1,0 +1,79 @@
+Total cached .npz files: 183336
+  Scanned 10000/183336 files... (10000 with NaN so far)
+  Scanned 20000/183336 files... (20000 with NaN so far)
+  Scanned 30000/183336 files... (30000 with NaN so far)
+  Scanned 40000/183336 files... (40000 with NaN so far)
+  Scanned 50000/183336 files... (50000 with NaN so far)
+  Scanned 60000/183336 files... (60000 with NaN so far)
+  Scanned 70000/183336 files... (70000 with NaN so far)
+  Scanned 80000/183336 files... (80000 with NaN so far)
+  Scanned 90000/183336 files... (90000 with NaN so far)
+  Scanned 100000/183336 files... (100000 with NaN so far)
+  Scanned 110000/183336 files... (110000 with NaN so far)
+  Scanned 120000/183336 files... (120000 with NaN so far)
+  Scanned 130000/183336 files... (130000 with NaN so far)
+  Scanned 140000/183336 files... (140000 with NaN so far)
+  Scanned 150000/183336 files... (150000 with NaN so far)
+  Scanned 160000/183336 files... (160000 with NaN so far)
+  Scanned 170000/183336 files... (170000 with NaN so far)
+  Scanned 180000/183336 files... (180000 with NaN so far)
+
+======================================================================
+NaN INVESTIGATION REPORT
+======================================================================
+
+Total cache files:       183,336
+Corrupt/unloadable:      0
+Files with NaN:          183,336  (100.00%)
+Files fully NaN:         183,336
+Embedding shapes seen:   {(28, 2048)}
+
+Total embedding vectors: 5,133,408
+Vectors with any NaN:    5,133,408  (100.0000%)
+
+Total scalar elements:   10,513,219,584
+NaN scalar elements:     10,513,219,584  (100.000000%)
+
+--- Files with NaN (first 20) ---
+File                                                      Shape   NaN rows Total rows   NaN frac AllNaN
+00003ba5a698b23b42beba7fbaf43e73a4694278.npz         (28, 2048)         28         28     1.0000    YES
+0000df8b8802cfa13d4181778847fcbeeede510c.npz         (28, 2048)         28         28     1.0000    YES
+000131540bfa2362382aa92e02f631830a355672.npz         (28, 2048)         28         28     1.0000    YES
+0001737b578ad742f511c35c77bb91014287127f.npz         (28, 2048)         28         28     1.0000    YES
+000185a52d625c41fc9530a5fafb5b9511c8b500.npz         (28, 2048)         28         28     1.0000    YES
+00028a1a492171e4cee0e2ffe75bfc651a0d6c86.npz         (28, 2048)         28         28     1.0000    YES
+00029b4d729e25bcfe3a7a2bf1848c2d6339f040.npz         (28, 2048)         28         28     1.0000    YES
+0003235d7352d1024c6283055730f3ffa199f028.npz         (28, 2048)         28         28     1.0000    YES
+000373cccd5ab0e0a051a05d2abecf34374f5b98.npz         (28, 2048)         28         28     1.0000    YES
+0003c943f487ef2d42be07258cc1bb15ee32aca0.npz         (28, 2048)         28         28     1.0000    YES
+0004100ec5650293d102c39568e2a1806dd50aed.npz         (28, 2048)         28         28     1.0000    YES
+00046ccf1df5bfc0f167f0079efca685b68ca6fc.npz         (28, 2048)         28         28     1.0000    YES
+000654b7c1d9a12706a4af0bae65650932b1d2c1.npz         (28, 2048)         28         28     1.0000    YES
+000689187ef98416b83c058fd88251fb421341c0.npz         (28, 2048)         28         28     1.0000    YES
+0006dbddc4ec7f2b5970ce0d2498a6b03b6864a6.npz         (28, 2048)         28         28     1.0000    YES
+0007064af4d3e1deaf94243f73d08aad89df2a09.npz         (28, 2048)         28         28     1.0000    YES
+0007fe726f41a8b8e4643d53c22856fb61de2598.npz         (28, 2048)         28         28     1.0000    YES
+000807338fce2f7e1bfdb92e4972d7a134e32713.npz         (28, 2048)         28         28     1.0000    YES
+0008516366859a63110fa2454d25c618e2d902df.npz         (28, 2048)         28         28     1.0000    YES
+000936a7585b872cb25e8e1bb106a6da44fde9b1.npz         (28, 2048)         28         28     1.0000    YES
+  ... and 183316 more files with NaN
+
+--- NaN fraction distribution across affected files ---
+  Min:    1.000000
+  Median: 1.000000
+  Max:    1.000000
+  Mean:   1.000000
+
+--- Sample NaN file value ranges ---
+  00003ba5a698b23b42beba7fbaf43e73a4694278.npz: ALL values are NaN/Inf, inf=0
+  0000df8b8802cfa13d4181778847fcbeeede510c.npz: ALL values are NaN/Inf, inf=0
+  000131540bfa2362382aa92e02f631830a355672.npz: ALL values are NaN/Inf, inf=0
+  0001737b578ad742f511c35c77bb91014287127f.npz: ALL values are NaN/Inf, inf=0
+  000185a52d625c41fc9530a5fafb5b9511c8b500.npz: ALL values are NaN/Inf, inf=0
+
+======================================================================
+SUMMARY: 5,133,408 NaN vectors out of 5,133,408 total (100.0000%)
+Clean vectors available: 0
+
+Simple fix: filter out NaN rows before PCA.
+======================================================================

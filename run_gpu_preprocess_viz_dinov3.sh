@@ -81,13 +81,12 @@ CLUSTER_NUM_IMAGES=35000
 VIZ_NUM_IMAGES=100
 
 # Patch/standardization defaults
-PAD_SIZE=1024
 LARGE_SIZE=512
 SMALL_SIZE=128
-# Sliding window strides (default: 50% overlap → stride = size / 2)
+# Small-patch strides: stride_x=64 (50% horizontal overlap), stride_y=128 (no vertical overlap)
 SMALL_STRIDE=64
 SMALL_STRIDE_X=""  # empty = use SMALL_STRIDE for both axes
-SMALL_STRIDE_Y=""
+SMALL_STRIDE_Y="128"  # default: no vertical overlap (= small_size)
 LARGE_STRIDE="$LARGE_SIZE"
 LARGE_STRIDE_X=""
 LARGE_STRIDE_Y=""
@@ -96,10 +95,10 @@ LARGE_STRIDE_Y=""
 WEIGHTS_PATH="weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 
 # Embedding batch size (patches to accumulate across multiple images)
-# With 128px patches + 64px stride on 1024px images, each image produces ~225 patches.
-# EMBED_BATCH controls when the MultiImageBatchedEmbedder flushes accumulated patches
-# to the GPU.  Setting this to ~9-18× patches-per-image (2048) ensures the GPU gets
-# large batches while GPU_BATCH_SIZE controls the actual per-forward-pass sub-batch.
+# With 128px small patches inside 512px grid cells (stride_x=64, stride_y=128),
+# each grid cell yields 7×4=28 patches.  EMBED_BATCH controls when the
+# MultiImageBatchedEmbedder flushes accumulated patches to the GPU.
+# GPU_BATCH_SIZE controls the actual per-forward-pass sub-batch.
 EMBED_BATCH=2048
 # GPU batch size (patches per ViT forward pass - increase to use more VRAM)
 GPU_BATCH_SIZE=512
@@ -110,7 +109,8 @@ K=40
 
 # Fit subset and PCA defaults
 FIT_SMALL_PATCHES_PER_IMAGE=64
-PCA_DIM=128
+PCA_DIM=256
+POOL_MODE="cls_avg"
 
 # HDBSCAN defaults (only used if CLUSTERER=hdbscan)
 MIN_CLUSTER_SIZE=15
@@ -143,6 +143,8 @@ while [[ $# -gt 0 ]]; do
       GPU_BATCH_SIZE="$2"; shift 2 ;;
     --pca-dim)
       PCA_DIM="$2"; shift 2 ;;
+    --pool-mode)
+      POOL_MODE="$2"; shift 2 ;;
     --fit-small-patches-per-image)
       FIT_SMALL_PATCHES_PER_IMAGE="$2"; shift 2 ;;
     --num-gpus)
@@ -170,8 +172,7 @@ echo "  data_root: $DATA_ROOT"
 echo "  split: $SPLIT"
 echo "  cluster_num_images: $CLUSTER_NUM_IMAGES"
 echo "  viz_num_images: $VIZ_NUM_IMAGES"
-echo "  pad_size: $PAD_SIZE"
-echo "  large_size: $LARGE_SIZE"
+echo "  large_size (grid_size): $LARGE_SIZE"
 echo "  small_size: $SMALL_SIZE"
 echo "  small_stride: $SMALL_STRIDE (stride_x=${SMALL_STRIDE_X:-$SMALL_STRIDE} stride_y=${SMALL_STRIDE_Y:-$SMALL_STRIDE})"
 echo "  weights_path: $WEIGHTS_PATH"
@@ -181,6 +182,7 @@ echo "  clusterer: $CLUSTERER"
 echo "  k: $K"
 echo "  fit_small_patches_per_image: $FIT_SMALL_PATCHES_PER_IMAGE"
 echo "  pca_dim: $PCA_DIM"
+echo "  pool_mode: $POOL_MODE"
 echo "  num_gpus: $NUM_GPUS"
 echo ""
 
@@ -197,8 +199,6 @@ PYTHON_ARGS="\
   --size-stats-n $SIZE_STATS_N \
   --cluster-num-images $CLUSTER_NUM_IMAGES \
   --viz-num-images $VIZ_NUM_IMAGES \
-  --max-edge $PAD_SIZE \
-  --pad-size $PAD_SIZE \
   --large-size $LARGE_SIZE --large-stride $LARGE_STRIDE \
   --small-size $SMALL_SIZE --small-stride $SMALL_STRIDE \
   --weights-path $WEIGHTS_PATH \
@@ -208,6 +208,7 @@ PYTHON_ARGS="\
   --k $K \
   --fit-small-patches-per-image $FIT_SMALL_PATCHES_PER_IMAGE \
   --pca-dim $PCA_DIM \
+  --pool-mode $POOL_MODE \
   --hdbscan-min-cluster-size $MIN_CLUSTER_SIZE \
   --hdbscan-min-samples $MIN_SAMPLES \
   --hdbscan-jobs $HDBSCAN_JOBS \
