@@ -231,7 +231,7 @@ fi
 #   <=2 GPUs: nccl (1 slice per physical GPU, fast GPU-native collectives)
 #   >2 GPUs:  gloo (CPU-based collectives, allows multiple slices per physical GPU)
 if [ "$DIST_BACKEND" = "auto" ]; then
-    if [ "$NUM_GPUS" -le 2 ]; then
+    if [ "$NUM_GPUS" -lt 2 ]; then
         DIST_BACKEND="nccl"
     else
         DIST_BACKEND="gloo"

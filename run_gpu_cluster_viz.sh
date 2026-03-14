@@ -80,6 +80,8 @@ FIT_SMALL_PATCHES_PER_IMAGE=64
 MIN_CLUSTER_SIZE=15
 MIN_SAMPLES=0
 HDBSCAN_JOBS=8
+SAVE_CLUSTER_DATA=false
+CLUSTER_DATA_DIR="outputs/cluster_data"
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -101,6 +103,8 @@ while [[ $# -gt 0 ]]; do
     --large-stride)       LARGE_STRIDE="$2"; shift 2 ;;
     --large-stride-x)     LARGE_STRIDE_X="$2"; shift 2 ;;
     --large-stride-y)     LARGE_STRIDE_Y="$2"; shift 2 ;;
+    --save-cluster-data)  SAVE_CLUSTER_DATA=true; shift ;;
+    --cluster-data-dir)   CLUSTER_DATA_DIR="$2"; shift 2 ;;
     *)                    echo "Unknown arg: $1"; shift ;;
   esac
 done
@@ -121,6 +125,8 @@ echo "  clusterer: $CLUSTERER"
 echo "  k: $K"
 echo "  pca_dim: $PCA_DIM"
 echo "  fit_small_patches_per_image: $FIT_SMALL_PATCHES_PER_IMAGE"
+echo "  save_cluster_data: $SAVE_CLUSTER_DATA"
+echo "  cluster_data_dir: $CLUSTER_DATA_DIR"
 echo ""
 
 # Build Python args (no GPU needed for clustering — runs on CPU)
@@ -156,6 +162,9 @@ if [ -n "$LARGE_STRIDE_X" ]; then
 fi
 if [ -n "$LARGE_STRIDE_Y" ]; then
     PYTHON_ARGS="$PYTHON_ARGS --large-stride-y $LARGE_STRIDE_Y"
+fi
+if [ "$SAVE_CLUSTER_DATA" = true ]; then
+    PYTHON_ARGS="$PYTHON_ARGS --save-cluster-data --cluster-data-dir $CLUSTER_DATA_DIR"
 fi
 
 echo "=== Clustering + Visualization (reading from cache) ==="

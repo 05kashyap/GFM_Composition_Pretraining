@@ -95,6 +95,12 @@ def find_jpgs(data_root: Path, split: str) -> List[Path]:
 
 
 def sample_stratified(all_paths: List[Path], split_dir: Path, n: int, rng: random.Random) -> List[Path]:
+    if n >= len(all_paths):
+        sampled = list(all_paths)
+        rng.shuffle(sampled)
+        print(f"Stratified sampling: requested {n} >= available {len(all_paths)}; using all images")
+        return sampled
+
     class_to_paths: Dict[str, List[Path]] = defaultdict(list)
     for p in all_paths:
         try:
@@ -112,12 +118,25 @@ def sample_stratified(all_paths: List[Path], split_dir: Path, n: int, rng: rando
     remainder = max(0, n - per_class * num_classes)
 
     sampled: List[Path] = []
+    sampled_set = set()
     class_names = sorted(class_to_paths.keys())
     for i, cls in enumerate(class_names):
         pool = class_to_paths[cls]
         take = per_class + (1 if i < remainder else 0)
         take = min(take, len(pool))
-        sampled.extend(rng.sample(pool, k=take))
+        picked = rng.sample(pool, k=take)
+        sampled.extend(picked)
+        sampled_set.update(picked)
+
+    # If some classes had fewer samples than their quota, redistribute the
+    # unused quota across the remaining images so we still reach n whenever
+    # enough images are available.
+    deficit = n - len(sampled)
+    if deficit > 0:
+        remaining = [p for p in all_paths if p not in sampled_set]
+        if remaining:
+            extra = rng.sample(remaining, k=min(deficit, len(remaining)))
+            sampled.extend(extra)
 
     rng.shuffle(sampled)
     sampled = sampled[: min(n, len(sampled))]

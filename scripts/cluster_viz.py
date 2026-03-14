@@ -187,6 +187,13 @@ def main() -> int:
     parser.add_argument("--save-embeddings", action="store_true")
     parser.add_argument("--size-stats-n", type=int, default=1000)
 
+    # Composition-aware training data export
+    parser.add_argument("--save-cluster-data", action="store_true",
+                        help="Export cluster centroids + per-cell compositional targets "
+                             "for composition-aware training.")
+    parser.add_argument("--cluster-data-dir", type=str, default="outputs/cluster_data",
+                        help="Directory to write cluster data (centroids, manifest, targets).")
+
     args = parser.parse_args()
 
     # Resolve per-axis strides
@@ -544,9 +551,166 @@ def main() -> int:
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
+    # ---------------------------------------------------------------
+    # Export cluster data for composition-aware training
+    # ---------------------------------------------------------------
+    if args.save_cluster_data and clusterer_name != "hdbscan":
+        _export_cluster_data(
+            args=args,
+            cluster_paths=cluster_paths,
+            embeddings_by_path=embeddings_by_path,
+            cells_by_path=cells_by_path,
+            cell_embeddings_by_path=cell_embeddings_by_path,
+            pca=pca,
+            model=model,
+            k=int(args.k),
+            embedding_dim=embedding_dim,
+            embedder_name=embedder_name,
+        )
+    elif args.save_cluster_data and clusterer_name == "hdbscan":
+        print("WARNING: --save-cluster-data not supported with HDBSCAN (variable cluster count). "
+              "Use a fixed-k clusterer like sklearn_kmeans.")
+
     print(f"\nSaved outputs to: {out_dir}")
     print(f"Cache dir: {cache_dir}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Cluster data export for composition-aware training
+# ---------------------------------------------------------------------------
+
+def _export_cluster_data(
+    *,
+    args,
+    cluster_paths: List[Path],
+    embeddings_by_path: Dict[Path, np.ndarray],
+    cells_by_path: Dict[Path, List[GridCell]],
+    cell_embeddings_by_path: Dict[Path, List[np.ndarray]],
+    pca,
+    model,
+    k: int,
+    embedding_dim: int,
+    embedder_name: str,
+) -> None:
+    """Export cluster centroids and per-cell compositional targets.
+
+    Produces:
+        cluster_data_dir/
+            centroids.npy       — (k, embedding_dim) cluster centers in original DINOv3 space
+            targets.npy         — (N_total_cells, embedding_dim) compositional target per cell
+            manifest.json       — per-cell metadata (image path, row, col, target index, etc.)
+            pca_model.pkl       — fitted PCA model
+            kmeans_model.pkl    — fitted KMeans model
+    """
+    cluster_data_dir = Path(args.cluster_data_dir)
+    cluster_data_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n=== Exporting cluster data to {cluster_data_dir} ===")
+
+    # Step 1: Compute cluster centroids in ORIGINAL embedding space.
+    # For each cluster, collect all original-space embeddings assigned to it,
+    # then average them.
+    print("Computing cluster centroids in original embedding space...")
+    centroid_accum = np.zeros((k, embedding_dim), dtype=np.float64)
+    centroid_count = np.zeros(k, dtype=np.int64)
+
+    for p in tqdm(cluster_paths, desc="Assigning clusters (centroids)", unit="img"):
+        embs_raw = embeddings_by_path.get(p)
+        if embs_raw is None:
+            continue
+        embs_norm = l2_normalize_np(embs_raw)
+        embs_pca = pca.transform(embs_norm).astype(np.float32)
+        embs_pca = l2_normalize_np(embs_pca)
+        labels = model.predict(embs_pca)
+        for cid in range(k):
+            mask = labels == cid
+            if np.any(mask):
+                centroid_accum[cid] += embs_raw[mask].astype(np.float64).sum(axis=0)
+                centroid_count[cid] += int(mask.sum())
+
+    # Compute mean centroid, L2-normalize
+    for cid in range(k):
+        if centroid_count[cid] > 0:
+            centroid_accum[cid] /= centroid_count[cid]
+    centroids_raw = l2_normalize_np(centroid_accum.astype(np.float32))
+    np.save(cluster_data_dir / "centroids.npy", centroids_raw)
+    print(f"  Saved centroids: {centroids_raw.shape} to {cluster_data_dir / 'centroids.npy'}")
+
+    # Step 2: For each image, for each grid cell, compute the compositional target.
+    # target = mean of centroids_raw[cluster_id] for each small patch in the cell.
+    print("Computing per-cell compositional targets...")
+    manifest_entries: List[dict] = []
+    all_targets: List[np.ndarray] = []
+    target_idx = 0
+
+    for p in tqdm(cluster_paths, desc="Computing targets", unit="img"):
+        cells = cells_by_path.get(p)
+        cell_embs_list = cell_embeddings_by_path.get(p)
+        if cells is None or cell_embs_list is None:
+            continue
+
+        for ci, (cell, cell_emb) in enumerate(zip(cells, cell_embs_list)):
+            if cell_emb is None:
+                continue
+            # Predict cluster IDs for this cell's patches
+            embs_norm = l2_normalize_np(cell_emb)
+            embs_pca = pca.transform(embs_norm).astype(np.float32)
+            embs_pca = l2_normalize_np(embs_pca)
+            labels = model.predict(embs_pca)
+
+            # Compositional target = mean of cluster centroids for these patches
+            target = centroids_raw[labels].mean(axis=0)
+            target = target / (np.linalg.norm(target) + 1e-12)  # L2 normalize
+            all_targets.append(target)
+
+            manifest_entries.append({
+                "image_path": str(p),
+                "cell_row": int(cell.row),
+                "cell_col": int(cell.col),
+                "cell_x0": int(cell.x0),
+                "cell_y0": int(cell.y0),
+                "cell_x1": int(cell.x1),
+                "cell_y1": int(cell.y1),
+                "n_patches": len(cell.patches),
+                "target_index": target_idx,
+            })
+            target_idx += 1
+
+    targets_array = np.stack(all_targets, axis=0).astype(np.float32)
+    np.save(cluster_data_dir / "targets.npy", targets_array)
+    print(f"  Saved targets: {targets_array.shape} to {cluster_data_dir / 'targets.npy'}")
+
+    # Step 3: Save manifest
+    manifest = {
+        "grid_size": int(args.large_size),
+        "small_size": int(args.small_size),
+        "small_stride_x": int(args.small_stride_x),
+        "small_stride_y": int(args.small_stride_y),
+        "embedding_dim": int(embedding_dim),
+        "k": k,
+        "pca_dim": int(args.pca_dim),
+        "clusterer": str(args.clusterer),
+        "embedder_name": embedder_name,
+        "weights_path": str(args.weights_path),
+        "pool_mode": str(args.pool_mode),
+        "n_images": len(set(e["image_path"] for e in manifest_entries)),
+        "n_cells": len(manifest_entries),
+        "cells": manifest_entries,
+    }
+    manifest_path = cluster_data_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"  Saved manifest: {len(manifest_entries)} cells from "
+          f"{manifest['n_images']} images to {manifest_path}")
+
+    # Step 4: Save PCA and KMeans models for inference on new images
+    with open(cluster_data_dir / "pca_model.pkl", "wb") as f:
+        pickle.dump(pca, f)
+    with open(cluster_data_dir / "kmeans_model.pkl", "wb") as f:
+        pickle.dump(model, f)
+    print(f"  Saved PCA + KMeans models to {cluster_data_dir}")
+
+    print(f"=== Cluster data export complete: {cluster_data_dir} ===")
 
 
 # ---------------------------------------------------------------------------
