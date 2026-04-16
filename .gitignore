@@ -3,6 +3,10 @@ data/fmow/
 slurm*
 outputs
 logs
+data/eval
+legacy_scripts
+wandb
+
 # Local model weights (keep out of git)
 weights/
 *.pth

@@ -193,6 +193,12 @@ def main() -> int:
                              "for composition-aware training.")
     parser.add_argument("--cluster-data-dir", type=str, default="outputs/cluster_data",
                         help="Directory to write cluster data (centroids, manifest, targets).")
+    parser.add_argument("--use-pca-targets", action="store_true",
+                        help="Use PCA embeddings (256-d) as targets instead of centroid-averaged "
+                             "embeddings (2048-d). Recommended for better target diversity.")
+    parser.add_argument("--manifest-only", action="store_true",
+                        help="Only generate manifest.json without running clustering or computing "
+                             "targets. Use this when training with loss_comp=0 (QSACL mode).")
 
     args = parser.parse_args()
 
@@ -299,6 +305,22 @@ def main() -> int:
     if loaded_count == 0:
         print("ERROR: No embeddings found in cache. Run embed_patches.py first.")
         return 1
+
+    # ---------------------------------------------------------------
+    # Manifest-only mode: skip clustering, just export cell metadata
+    # ---------------------------------------------------------------
+    if getattr(args, 'manifest_only', False):
+        print("\n=== Manifest-only mode: skipping clustering ===")
+        _export_manifest_only(
+            args=args,
+            cluster_paths=cluster_paths,
+            cells_by_path=cells_by_path,
+            cell_embeddings_by_path=cell_embeddings_by_path,
+            embedder_name=embedder_name,
+        )
+        print(f"\nManifest-only export complete.")
+        print(f"Cache dir: {cache_dir}")
+        return 0
 
     # ---------------------------------------------------------------
     # Clustering
@@ -566,6 +588,7 @@ def main() -> int:
             k=int(args.k),
             embedding_dim=embedding_dim,
             embedder_name=embedder_name,
+            use_pca_targets=args.use_pca_targets,
         )
     elif args.save_cluster_data and clusterer_name == "hdbscan":
         print("WARNING: --save-cluster-data not supported with HDBSCAN (variable cluster count). "
@@ -574,6 +597,81 @@ def main() -> int:
     print(f"\nSaved outputs to: {out_dir}")
     print(f"Cache dir: {cache_dir}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Manifest-only export (no clustering, for QSACL mode)
+# ---------------------------------------------------------------------------
+
+def _export_manifest_only(
+    *,
+    args,
+    cluster_paths: List[Path],
+    cells_by_path: Dict[Path, List[GridCell]],
+    cell_embeddings_by_path: Dict[Path, List[np.ndarray]],
+    embedder_name: str,
+) -> None:
+    """Export only manifest.json without clustering or targets.
+
+    Use this when training with loss_comp=0 (QSACL mode) where targets.npy
+    is not needed. The manifest provides cell metadata for the dataset.
+
+    Produces:
+        cluster_data_dir/
+            manifest.json  — per-cell metadata (image path, row, col, n_patches, etc.)
+    """
+    cluster_data_dir = Path(args.cluster_data_dir)
+    cluster_data_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n=== Exporting manifest to {cluster_data_dir} ===")
+
+    manifest_entries: List[dict] = []
+
+    for p in tqdm(cluster_paths, desc="Building manifest", unit="img"):
+        cells = cells_by_path.get(p)
+        cell_embs_list = cell_embeddings_by_path.get(p)
+        if cells is None or cell_embs_list is None:
+            continue
+
+        for ci, (cell, cell_emb) in enumerate(zip(cells, cell_embs_list)):
+            if cell_emb is None:
+                continue
+
+            manifest_entries.append({
+                "image_path": str(p),
+                "cell_row": int(cell.row),
+                "cell_col": int(cell.col),
+                "cell_x0": int(cell.x0),
+                "cell_y0": int(cell.y0),
+                "cell_x1": int(cell.x1),
+                "cell_y1": int(cell.y1),
+                "n_patches": len(cell.patches),
+                "target_index": -1,  # No target in manifest-only mode
+                # Metadata for cache path reconstruction
+                "embedder_name": embedder_name,
+                "weights_path": str(args.weights_path),
+                "small_size": int(args.small_size),
+                "small_stride_x": int(args.small_stride_x),
+                "small_stride_y": int(args.small_stride_y),
+            })
+
+    # Save manifest
+    manifest = {
+        "embedder_name": embedder_name,
+        "weights_path": str(args.weights_path),
+        "grid_size": int(args.large_size),
+        "small_size": int(args.small_size),
+        "small_stride_x": int(args.small_stride_x),
+        "small_stride_y": int(args.small_stride_y),
+        "embedding_dim": 0,  # No targets
+        "n_images": len(set(e["image_path"] for e in manifest_entries)),
+        "n_cells": len(manifest_entries),
+        "manifest_only": True,  # Flag to indicate no targets.npy
+        "cells": manifest_entries,
+    }
+    manifest_path = cluster_data_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    print(f"  Saved manifest: {len(manifest_entries)} cells to {manifest_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -592,21 +690,33 @@ def _export_cluster_data(
     k: int,
     embedding_dim: int,
     embedder_name: str,
+    use_pca_targets: bool = False,
 ) -> None:
     """Export cluster centroids and per-cell compositional targets.
 
     Produces:
         cluster_data_dir/
             centroids.npy       — (k, embedding_dim) cluster centers in original DINOv3 space
-            targets.npy         — (N_total_cells, embedding_dim) compositional target per cell
+            targets.npy         — (N_total_cells, target_dim) compositional target per cell
             manifest.json       — per-cell metadata (image path, row, col, target index, etc.)
             pca_model.pkl       — fitted PCA model
             kmeans_model.pkl    — fitted KMeans model
+
+    When ``use_pca_targets=True``, targets are 256-d PCA embeddings (mean of PCA patches
+    per cell), which have MUCH more diversity than the 2048-d centroid-averaged targets.
+    This is recommended to avoid target collapse (pairwise cos ~0.0 vs ~0.75).
     """
     cluster_data_dir = Path(args.cluster_data_dir)
     cluster_data_dir.mkdir(parents=True, exist_ok=True)
 
+    pca_dim = int(args.pca_dim)
+    target_dim = pca_dim if use_pca_targets else embedding_dim
+
     print(f"\n=== Exporting cluster data to {cluster_data_dir} ===")
+    if use_pca_targets:
+        print(f"    Using PCA targets: {pca_dim}-d (recommended for diversity)")
+    else:
+        print(f"    Using centroid-averaged targets: {embedding_dim}-d")
 
     # Step 1: Compute cluster centroids in ORIGINAL embedding space.
     # For each cluster, collect all original-space embeddings assigned to it,
@@ -638,7 +748,8 @@ def _export_cluster_data(
     print(f"  Saved centroids: {centroids_raw.shape} to {cluster_data_dir / 'centroids.npy'}")
 
     # Step 2: For each image, for each grid cell, compute the compositional target.
-    # target = mean of centroids_raw[cluster_id] for each small patch in the cell.
+    # If use_pca_targets: target = mean of PCA patches per cell (256-d)
+    # Otherwise: target = mean of centroids_raw[cluster_id] for each small patch (2048-d)
     print("Computing per-cell compositional targets...")
     manifest_entries: List[dict] = []
     all_targets: List[np.ndarray] = []
@@ -653,14 +764,20 @@ def _export_cluster_data(
         for ci, (cell, cell_emb) in enumerate(zip(cells, cell_embs_list)):
             if cell_emb is None:
                 continue
-            # Predict cluster IDs for this cell's patches
+
+            # Transform to PCA space (needed for both modes)
             embs_norm = l2_normalize_np(cell_emb)
             embs_pca = pca.transform(embs_norm).astype(np.float32)
             embs_pca = l2_normalize_np(embs_pca)
-            labels = model.predict(embs_pca)
 
-            # Compositional target = mean of cluster centroids for these patches
-            target = centroids_raw[labels].mean(axis=0)
+            if use_pca_targets:
+                # PCA target: mean of PCA patches (256-d), much more diverse!
+                target = embs_pca.mean(axis=0)
+            else:
+                # Original approach: mean of cluster centroids (2048-d)
+                labels = model.predict(embs_pca)
+                target = centroids_raw[labels].mean(axis=0)
+
             target = target / (np.linalg.norm(target) + 1e-12)  # L2 normalize
             all_targets.append(target)
 
@@ -681,13 +798,25 @@ def _export_cluster_data(
     np.save(cluster_data_dir / "targets.npy", targets_array)
     print(f"  Saved targets: {targets_array.shape} to {cluster_data_dir / 'targets.npy'}")
 
+    # Verify target diversity
+    if len(all_targets) > 100:
+        sample_idx = np.random.choice(len(all_targets), min(1000, len(all_targets)), replace=False)
+        sample = targets_array[sample_idx]
+        cos_sim = sample @ sample.T
+        np.fill_diagonal(cos_sim, 0)
+        mean_cos = cos_sim.sum() / (len(sample) * (len(sample) - 1))
+        print(f"  Target diversity check: pairwise cosine = {mean_cos:.4f} "
+              f"({'good' if mean_cos < 0.5 else 'WARNING: may be too collapsed'})")
+
     # Step 3: Save manifest
     manifest = {
         "grid_size": int(args.large_size),
         "small_size": int(args.small_size),
         "small_stride_x": int(args.small_stride_x),
         "small_stride_y": int(args.small_stride_y),
-        "embedding_dim": int(embedding_dim),
+        "embedding_dim": int(target_dim),  # Use target_dim, not embedding_dim
+        "original_embedding_dim": int(embedding_dim),
+        "use_pca_targets": use_pca_targets,
         "k": k,
         "pca_dim": int(args.pca_dim),
         "clusterer": str(args.clusterer),
