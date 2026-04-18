@@ -122,9 +122,53 @@ bash run_bovw_ablation.sh --epochs 20
 bash run_bovw_ablation.sh --parallel --epochs 20
 ```
 
+## BoVW Visualizations
+
+The repository includes a consolidated visualization generator:
+
+- Script: `scripts/generate_bovw_visualizations.py`
+- GPU wrapper: `run_gpu_generate_bovw_visualizations.sh`
+- Default output folder: `outputs/visualizations/`
+
+Generate all visualizations:
+
+```bash
+# Local run
+python scripts/generate_bovw_visualizations.py
+
+# SLURM run (dynamicvis env + MIG selection)
+sbatch run_gpu_generate_bovw_visualizations.sh
+```
+
+Generate a subset with `--skip`:
+
+```bash
+# Example: run only visualization 6
+python scripts/generate_bovw_visualizations.py --skip 1,2,3,4,5,7,8
+```
+
+### What Each Visualization Signifies
+
+| Viz | Output | What It Signifies |
+|---|---|---|
+| 1 | [viz_01_histogram_gallery.png](outputs/visualizations/viz_01_histogram_gallery.png) | Diverse semantic cells and their BoVW histogram structure. Shows how different scenes activate different vocabulary distributions. |
+| 2 | [viz_02_vocabulary_gallery.png](outputs/visualizations/viz_02_vocabulary_gallery.png) | Top visual words and their most activating patches. Interprets each centroid as recurring local texture/structure patterns. |
+| 3 | [viz_03_similarity_matrix.png](outputs/visualizations/viz_03_similarity_matrix.png) | Category-level similarity structure. Compares BoVW histogram distances against pooled DINO-style similarity to show separability. |
+| 4 | [viz_04_centroid_tsne.png](outputs/visualizations/viz_04_centroid_tsne.png) | Global vocabulary geometry. Shows how centroids organize in embedding space and which classes dominate each region. |
+| 5 | [viz_05_prediction_convergence.png](outputs/visualizations/viz_05_prediction_convergence.png) | Training-stage behavior on a fixed cell. Demonstrates how predicted histograms converge across checkpoints and how EMD changes. |
+| 6 | [viz_06_spatial_heatmaps.png](outputs/visualizations/viz_06_spatial_heatmaps.png) | Spatial attention diversity. For multiple different cells, overlays top diverse centroid activations to show that clusters focus on different regions/features. |
+| 7 | [viz_07_category_prototypes.png](outputs/visualizations/viz_07_category_prototypes.png) | Category prototypes in histogram space. Summarizes class-specific BoVW signatures and intra-class compactness trends. |
+| 8 | [viz_08_cluster_similarity.png](outputs/visualizations/viz_08_cluster_similarity.png) | Near-vs-far cluster semantics at patch level. Uses auto-selected near and far centroid pairs to show patch similarity for close clusters and contrast for distant ones. |
+
+Notes:
+
+- All figures are saved as 300-DPI PNGs.
+- The script is fault-tolerant per visualization (one failure does not stop the rest).
+- If `outputs/bovw_checkpoints` is missing, checkpoint-dependent steps auto-fallback to an available `outputs/bovw_training*` directory.
+
 ## Downstream Evaluation (eval/)
 
-The repository includes three downstream evaluation tracks for transferred
+The repository includes four downstream evaluation tracks for transferred
 DynamicVis representations.
 
 ### 1) CBIR Retrieval (AID / ForestNet)
@@ -218,6 +262,43 @@ Typical change-detection artifacts:
 - outputs/change_detection/best_cd_model.pth
 - outputs/change_detection/training_curves.png
 - outputs/change_detection/predictions.png
+
+### 4) LEVIR-ship Object Detection
+
+Entry point:
+
+- eval/object-detection/main.py
+- Wrapper: run_gpu_object_detection_eval.sh
+
+What it does:
+
+- Uses DynamicVis (loaded from BoVW checkpoints) as the Faster R-CNN backbone.
+- Trains/evaluates on LEVIR-ship YOLO-format labels.
+- Reports mAP at multiple IoU thresholds and saves prediction visualizations.
+
+Example commands:
+
+```bash
+# Train + evaluate on LEVIR-ship
+sbatch run_gpu_object_detection_eval.sh \
+    --data-root data/eval/object-det \
+    --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
+    --num-epochs 5
+
+# Evaluate only from a saved detector checkpoint
+sbatch run_gpu_object_detection_eval.sh \
+    --eval-only \
+    --data-root data/eval/object-det \
+    --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
+    --detector-checkpoint outputs/object_detection/best_detector.pth
+```
+
+Typical object-detection artifacts:
+
+- outputs/object_detection/best_detector.pth
+- outputs/object_detection/last_detector.pth
+- outputs/object_detection/metrics.txt
+- outputs/object_detection/predictions/*.png
 
 ## In-Domain fMoW Evaluation Scripts
 

@@ -6,7 +6,7 @@ logs
 data/eval
 legacy_scripts
 wandb
-
+object-det
 # Local model weights (keep out of git)
 weights/
 *.pth
