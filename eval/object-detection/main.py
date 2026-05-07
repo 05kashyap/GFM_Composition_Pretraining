@@ -32,6 +32,8 @@ from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.ops import MultiScaleRoIAlign, box_iou
 from torchvision.ops.feature_pyramid_network import FeaturePyramidNetwork
 
+from eval.adapters.prithvi_v2_adapter import PrithviEncoderV2
+
 warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -40,6 +42,7 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "eval" / "object-det"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "object_detection"
 DEFAULT_BACKBONE_WEIGHTS = REPO_ROOT / "outputs" / "bovw_training_8262" / "epoch_20.pth"
+DEFAULT_PRITHVI_WEIGHTS = REPO_ROOT / "weights" / "Prithvi_EO_V2_600M.pt"
 DEFAULT_DYNVIS_CONFIG = (
     REPO_ROOT / "configs_dynamicvis" / "fmow_pretrain" / "dynamicvis_b_fmow_s3_pretrain.py"
 )
@@ -366,13 +369,49 @@ class DynamicVisDetectionBackbone(nn.Module):
         return self.fpn(feat_dict)
 
 
+class PrithviDetectionBackbone(nn.Module):
+    """Prithvi v2 feature extractor + torchvision FPN for Faster R-CNN."""
+
+    def __init__(
+        self,
+        prithvi_checkpoint: str,
+        img_size: int,
+        fpn_out_channels: int = 256,
+        layer_indices: List[int] | None = None,
+    ):
+        super().__init__()
+        self.layer_indices = layer_indices or [-4, -3, -2, -1]
+        self.encoder = PrithviEncoderV2(
+            model_path=prithvi_checkpoint,
+            embedding_dim=512,
+            img_size=img_size,
+            in_chans=3,
+        )
+        self.out_channels = [self.encoder.feature_dim] * len(self.layer_indices)
+        self.fpn = FeaturePyramidNetwork(in_channels_list=self.out_channels, out_channels=fpn_out_channels)
+
+    def forward(self, x: torch.Tensor) -> OrderedDict[str, torch.Tensor]:
+        feats = self.encoder.forward_feature_maps(x, layer_indices=self.layer_indices)
+        feat_dict: OrderedDict[str, torch.Tensor] = OrderedDict(
+            (str(i), feat) for i, feat in enumerate(feats)
+        )
+        return self.fpn(feat_dict)
+
+
 def build_model(args: argparse.Namespace) -> FasterRCNN:
-    backbone = DynamicVisDetectionBackbone(
-        dynamicvis_config=args.dynamicvis_config,
-        img_size=args.img_size,
-        backbone_checkpoint=args.backbone_checkpoint,
-        fpn_out_channels=args.fpn_out_channels,
-    )
+    if args.model_type == "dynamicvis":
+        backbone = DynamicVisDetectionBackbone(
+            dynamicvis_config=args.dynamicvis_config,
+            img_size=args.img_size,
+            backbone_checkpoint=args.backbone_checkpoint,
+            fpn_out_channels=args.fpn_out_channels,
+        )
+    else:
+        backbone = PrithviDetectionBackbone(
+            prithvi_checkpoint=args.backbone_checkpoint,
+            img_size=args.img_size,
+            fpn_out_channels=args.fpn_out_channels,
+        )
 
     anchor_gen = AnchorGenerator(
         sizes=((16, 32), (32, 64), (64, 128), (128, 256)),
@@ -683,6 +722,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
 
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="dynamicvis",
+        choices=["dynamicvis", "prithvi", "prithvi2", "prithvi_v2"],
+    )
+
     parser.add_argument("--dynamicvis-config", type=str, default=str(DEFAULT_DYNVIS_CONFIG))
     parser.add_argument("--backbone-checkpoint", type=str, default=str(DEFAULT_BACKBONE_WEIGHTS))
     parser.add_argument("--detector-checkpoint", type=str, default="")
@@ -718,6 +764,9 @@ def main() -> None:
     parser = build_argparser()
     args = parser.parse_args()
 
+    if args.model_type in {"prithvi", "prithvi2", "prithvi_v2"} and args.backbone_checkpoint == str(DEFAULT_BACKBONE_WEIGHTS):
+        args.backbone_checkpoint = str(DEFAULT_PRITHVI_WEIGHTS)
+
     if args.dry_run:
         print("Dry-run configuration:")
         for k, v in sorted(vars(args).items()):
@@ -738,7 +787,7 @@ def main() -> None:
                 f"Expected split folders at {images_dir} and {labels_dir}"
             )
 
-    if not Path(args.dynamicvis_config).is_file():
+    if args.model_type == "dynamicvis" and not Path(args.dynamicvis_config).is_file():
         raise FileNotFoundError(f"DynamicVis config not found: {args.dynamicvis_config}")
 
     if not Path(args.backbone_checkpoint).is_file():

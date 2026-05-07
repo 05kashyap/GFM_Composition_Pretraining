@@ -5,7 +5,6 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
-#SBATCH --time=24:00:00
 
 # =============================================================================
 # BoVW DynamicVis Training — SLURM Script
@@ -102,10 +101,10 @@ fi
 
 # ── Defaults ──
 MANIFEST="data/fmow_manifest_train.json"
-HISTOGRAM_DIR="outputs/bovw_histograms"
-VOCAB_DIR="outputs/bovw_vocabulary"
-CELL_LABELS="outputs/bovw_histograms/cell_labels.npy"
-DATA_ROOT="data/fmow"
+HISTOGRAM_DIR="/mnt/usb/bovw_histograms"
+VOCAB_DIR="/mnt/usb/bovw_vocabulary"
+CELL_LABELS="/mnt/usb/bovw_histograms/cell_labels.npy"
+DATA_ROOT="/mnt/usb/fmow"
 PRETRAINED_BACKBONE="weights/pretrain_dynamicvis_b_bf16_mamba_best_single-label_f1-score_epoch_170.pth"
 OUTPUT_DIR="outputs/bovw_training"
 VOCAB_SIZE=512
@@ -114,7 +113,7 @@ BATCH_SIZE=32
 NUM_EPOCHS=100
 LR=5e-4
 LAMBDA_EMD=1.0
-LAMBDA_CLS=0#0.5
+LAMBDA_CLS=0.5 
 LAMBDA_MIL=0.25
 SINKHORN_EPS=0.05
 SINKHORN_ITERS=50
@@ -124,6 +123,7 @@ NUM_VIEWS=2
 MAX_SAMPLES=""
 DATA_FRACTION=""
 NO_PRETRAINED=""
+RESUME_FROM=""
 
 if [ -n "${SLURM_JOB_ID:-}" ]; then
     OUTPUT_DIR="${OUTPUT_DIR}_${SLURM_JOB_ID}"
@@ -155,6 +155,8 @@ while [[ $# -gt 0 ]]; do
         --max-samples)         MAX_SAMPLES="$2";         shift 2 ;;
         --data-fraction)       DATA_FRACTION="$2";       shift 2 ;;
         --no-pretrained)       NO_PRETRAINED="--no-pretrained"; shift ;;
+        --resume-from)         RESUME_FROM="$2";              shift 2 ;;
+        --reset-optim-on-resume) RESET_OPTIM_ON_RESUME="--reset-optim-on-resume"; shift ;;
         --debug)               NUM_EPOCHS=2; BATCH_SIZE=8; shift ;;
         *)                     shift ;;
     esac
@@ -184,15 +186,29 @@ if [ "$DIST_BACKEND" = "nccl" ] && [ "$NUM_GPUS" -gt 2 ]; then
 fi
 
 # ── CUDA devices ──
+## Uncomment to use from both GPUs
+# if [ "$NUM_GPUS" -gt 1 ] 2>/dev/null; then
+#     CUDA_DEVICES=""
+#     for ((i=0; i<NUM_GPUS && i<${#MIG_UUIDS[@]}; i++)); do
+#         [ -n "$CUDA_DEVICES" ] && CUDA_DEVICES="${CUDA_DEVICES},"
+#         CUDA_DEVICES="${CUDA_DEVICES}${MIG_UUIDS[$i]}"
+#     done
+#     export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
+# elif [ "$NUM_GPUS" -eq 1 ] 2>/dev/null; then
+#     export CUDA_VISIBLE_DEVICES="${MIG_UUIDS[0]}"
+# fi
+
+# ── CUDA devices ──
+## Use only from GPU1 to avoid contention with other jobs on GPU0 (if any)
 if [ "$NUM_GPUS" -gt 1 ] 2>/dev/null; then
     CUDA_DEVICES=""
-    for ((i=0; i<NUM_GPUS && i<${#MIG_UUIDS[@]}; i++)); do
+    for ((i=0; i<NUM_GPUS && i<${#MIG_GPU1[@]}; i++)); do
         [ -n "$CUDA_DEVICES" ] && CUDA_DEVICES="${CUDA_DEVICES},"
-        CUDA_DEVICES="${CUDA_DEVICES}${MIG_UUIDS[$i]}"
+        CUDA_DEVICES="${CUDA_DEVICES}${MIG_GPU1[$i]}"
     done
     export CUDA_VISIBLE_DEVICES="$CUDA_DEVICES"
 elif [ "$NUM_GPUS" -eq 1 ] 2>/dev/null; then
-    export CUDA_VISIBLE_DEVICES="${MIG_UUIDS[0]}"
+    export CUDA_VISIBLE_DEVICES="${MIG_GPU1[0]}"
 fi
 
 # ── Summary ──
@@ -220,6 +236,7 @@ echo "  Num GPUs (MIG):  $NUM_GPUS"
 echo "  Dist backend:    $DIST_BACKEND"
 echo "  Data fraction:   ${DATA_FRACTION:-1.0}"
 echo "  Max samples:     ${MAX_SAMPLES:-all}"
+echo "  Resume from:     ${RESUME_FROM:-none}"
 echo ""
 
 command -v nvidia-smi &>/dev/null && nvidia-smi
@@ -254,6 +271,8 @@ PYTHON_ARGS="\
     --sinkhorn-iters $SINKHORN_ITERS \
     --num-views $NUM_VIEWS \
     --dist-backend $DIST_BACKEND \
+    ${RESUME_FROM:+--resume-from $RESUME_FROM} \
+    ${RESET_OPTIM_ON_RESUME:-} \
     $MAX_SAMPLES_ARG \
     $NO_PRETRAINED"
 

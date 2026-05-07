@@ -376,6 +376,11 @@ def run(args: argparse.Namespace) -> None:
         if not Path(args.config_path).exists():
             raise FileNotFoundError(f"DynamicVis config not found: {args.config_path}")
 
+    if args.model_type in {"prithvi", "prithvi2", "prithvi_v2"}:
+        if not Path(args.model_path).exists():
+            raise FileNotFoundError(f"Prithvi v2 checkpoint not found: {args.model_path}")
+        args.config_path = None
+
     if args.model_type == "dynamicvis":
         # DynamicVis is RGB-only; keep AIDDataset in 3-channel mode.
         args.in_chans = 3
@@ -402,8 +407,13 @@ def run(args: argparse.Namespace) -> None:
                     f"Pass --img_size explicitly or fix the config. Root error: {e}"
                 )
 
+    if args.model_type in {"prithvi", "prithvi2", "prithvi_v2"}:
+        args.in_chans = 3
+
     if args.model_type == "dynamicvis" and args.embedding_dim == 384:
         args.embedding_dim = 768
+    elif args.model_type in {"prithvi", "prithvi2", "prithvi_v2"} and args.embedding_dim == 384:
+        args.embedding_dim = 512
 
     if args.dataset == "aid":
         _run_aid(args)

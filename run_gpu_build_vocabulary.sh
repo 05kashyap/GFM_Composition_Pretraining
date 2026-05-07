@@ -5,7 +5,6 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4 #NEVER CHANGE THIS
 #SBATCH --mem=64G
-#SBATCH --time=4:00:00
 
 # Build visual vocabulary from extracted patch tokens using FAISS K-means.
 # This is Phase 2 of the BoVW composition training pipeline.
@@ -62,10 +61,10 @@ MIG_GPU0=(
 # =============================================================================
 # Defaults
 # =============================================================================
-PATCH_TOKEN_DIR="outputs/patch_tokens_bovw"
-OUTPUT_DIR="outputs/bovw_vocabulary"
+PATCH_TOKEN_DIR="/mnt/usb/patch_tokens_bovw"
+OUTPUT_DIR="/mnt/usb/bovw_vocabulary"
 K=512
-SUBSAMPLE=5000000
+SUBSAMPLE=1000000
 SEED=42
 NITER=100
 NREDO=3

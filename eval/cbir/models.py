@@ -67,9 +67,22 @@ def create_model(
             embedding_dim=embedding_dim,
             device=device
         )
+    elif model_type in {'prithvi', 'prithvi2', 'prithvi_v2'}:
+        from eval.adapters.prithvi_v2_adapter import PrithviEncoderV2
+
+        print(f"✓ Creating Prithvi v2 encoder (embedding_dim={embedding_dim})")
+        model = PrithviEncoderV2(
+            model_path=model_path,
+            embedding_dim=embedding_dim,
+            device=device,
+            use_multi_scale=use_multi_scale,
+            layer_indices=layer_indices,
+            img_size=img_size,
+            in_chans=in_chans,
+        )
     else:
         raise ValueError(
-            f"Unsupported model_type: {model_type}. This repository copy currently supports only 'dynamicvis'."
+            f"Unsupported model_type: {model_type}. Supported values are dynamicvis, prithvi, prithvi2, and prithvi_v2."
         )
 
     print(f"✓ Model loaded successfully on {device}")

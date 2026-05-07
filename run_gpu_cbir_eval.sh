@@ -15,6 +15,7 @@
 #   sbatch run_gpu_cbir_eval.sh --checkpoint outputs/bovw_training_8262/final_backbone.pth
 #   sbatch run_gpu_cbir_eval.sh --data-dir data/eval/AID --max-per-class 20
 #   sbatch run_gpu_cbir_eval.sh --dataset forestnet --data-dir data/eval/deep/downloads/ForestNetDataset
+#   sbatch run_gpu_cbir_eval.sh --model-type prithvi2
 #   sbatch run_gpu_cbir_eval.sh --dry-run
 # =============================================================================
 
@@ -104,6 +105,7 @@ FORESTNET_MODE="both"
 MODEL_TYPE="dynamicvis"
 MODEL_PATH="outputs/bovw_training_8262/epoch_20.pth"
 CONFIG_PATH="architectures/DynamicVis/configs_DynamicVis/AID/dynamicvis_b_aid_mamba.py"
+PRITHVI_MODEL_PATH="weights/Prithvi_EO_V2_600M.pt"
 EMBEDDING_DIM=768
 IMG_SIZE=512
 BATCH_SIZE=32
@@ -148,6 +150,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ "$MODEL_TYPE" != "prithvi" ] && [ "$MODEL_TYPE" != "prithvi2" ] && [ "$MODEL_TYPE" != "prithvi_v2" ]; then
+    echo "Error: --model-type must be one of: dynamicvis, prithvi, prithvi2, prithvi_v2"
+    exit 1
+fi
+
+if [ "$MODEL_TYPE" = "prithvi" ] || [ "$MODEL_TYPE" = "prithvi2" ] || [ "$MODEL_TYPE" = "prithvi_v2" ]; then
+    if [ "$MODEL_PATH" = "outputs/bovw_training_8262/epoch_20.pth" ]; then
+        MODEL_PATH="$PRITHVI_MODEL_PATH"
+    fi
+    if [ "$EMBEDDING_DIM" = "768" ]; then
+        EMBEDDING_DIM=512
+    fi
+    CONFIG_PATH=""
+fi
+
 if [ "$DATASET" != "aid" ] && [ "$DATASET" != "forestnet" ]; then
     echo "Error: --dataset must be one of: aid, forestnet"
     exit 1
@@ -180,6 +197,11 @@ if [ "$MODEL_TYPE" = "dynamicvis" ] && [ ! -f "$CONFIG_PATH" ]; then
     exit 1
 fi
 
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ ! -f "$MODEL_PATH" ]; then
+    echo "Error: Prithvi v2 checkpoint not found: $MODEL_PATH"
+    exit 1
+fi
+
 if [ ! -d "$DATA_DIR" ]; then
     echo "Error: data directory not found: $DATA_DIR"
     exit 1
@@ -202,7 +224,7 @@ echo "  Data dir:        $DATA_DIR"
 echo "  ForestNet mode:  $FORESTNET_MODE"
 echo "  Model type:      $MODEL_TYPE"
 echo "  Checkpoint:      $MODEL_PATH"
-echo "  Config:          $CONFIG_PATH"
+echo "  Config:          ${CONFIG_PATH:-n/a}"
 echo "  Embedding dim:   $EMBEDDING_DIM"
 echo "  Image size:      $IMG_SIZE"
 echo "  Batch size:      $BATCH_SIZE"
@@ -227,7 +249,6 @@ PY_ARGS=(
     --data_dir "$DATA_DIR"
     --model_type "$MODEL_TYPE"
     --model_path "$MODEL_PATH"
-    --config_path "$CONFIG_PATH"
     --embedding_dim "$EMBEDDING_DIM"
     --img_size "$IMG_SIZE"
     --batch_size "$BATCH_SIZE"
@@ -237,6 +258,10 @@ PY_ARGS=(
     --nlist "$NLIST"
     --index_dir "$INDEX_DIR"
 )
+
+if [ -n "$CONFIG_PATH" ]; then
+    PY_ARGS+=(--config_path "$CONFIG_PATH")
+fi
 
 if [ "$DATASET" = "forestnet" ]; then
     PY_ARGS+=(--forestnet_mode "$FORESTNET_MODE")

@@ -15,6 +15,7 @@
 #   sbatch run_gpu_object_detection_eval.sh --num-epochs 10 --batch-size 2
 #   sbatch run_gpu_object_detection_eval.sh --eval-only --detector-checkpoint outputs/object_detection/best_detector.pth
 #   sbatch run_gpu_object_detection_eval.sh --max-train 500 --max-val 200 --max-test 200
+#   sbatch run_gpu_object_detection_eval.sh --model-type prithvi_v2
 #   sbatch run_gpu_object_detection_eval.sh --dry-run
 # =============================================================================
 
@@ -100,8 +101,10 @@ fi
 # -- Defaults --
 DATA_ROOT="data/eval/object-det/LEVIR-ship/LEVIR-ship"
 OUTPUT_DIR="outputs/object_detection"
+MODEL_TYPE="dynamicvis"
 DYNAMICVIS_CONFIG="configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py"
 BACKBONE_CHECKPOINT="outputs/bovw_training_8262/epoch_20.pth"
+PRITHVI_BACKBONE_CHECKPOINT="weights/Prithvi_EO_V2_600M.pt"
 DETECTOR_CHECKPOINT=""
 
 IMG_SIZE=512
@@ -130,6 +133,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --data-root)            DATA_ROOT="$2"; shift 2 ;;
         --output-dir)           OUTPUT_DIR="$2"; shift 2 ;;
+        --model-type)           MODEL_TYPE="$2"; shift 2 ;;
         --dynamicvis-config)    DYNAMICVIS_CONFIG="$2"; shift 2 ;;
         --backbone-checkpoint)  BACKBONE_CHECKPOINT="$2"; shift 2 ;;
         --detector-checkpoint)  DETECTOR_CHECKPOINT="$2"; shift 2 ;;
@@ -157,6 +161,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ "$MODEL_TYPE" != "prithvi" ] && [ "$MODEL_TYPE" != "prithvi2" ] && [ "$MODEL_TYPE" != "prithvi_v2" ]; then
+    echo "Error: --model-type must be one of: dynamicvis, prithvi, prithvi2, prithvi_v2"
+    exit 1
+fi
+
+if [ "$MODEL_TYPE" = "prithvi" ] || [ "$MODEL_TYPE" = "prithvi2" ] || [ "$MODEL_TYPE" = "prithvi_v2" ]; then
+    if [ "$BACKBONE_CHECKPOINT" = "outputs/bovw_training_8262/epoch_20.pth" ]; then
+        BACKBONE_CHECKPOINT="$PRITHVI_BACKBONE_CHECKPOINT"
+    fi
+    DYNAMICVIS_CONFIG=""
+fi
+
 if [ "$MIG_INDEX" -ge "${#MIG_UUIDS[@]}" ] || [ "$MIG_INDEX" -lt 0 ]; then
     echo "Error: --mig-index must be in [0, $(( ${#MIG_UUIDS[@]} - 1 ))]."
     exit 1
@@ -169,7 +185,7 @@ if [ ! -d "$DATA_ROOT" ]; then
     exit 1
 fi
 
-if [ ! -f "$DYNAMICVIS_CONFIG" ]; then
+if [ "$MODEL_TYPE" = "dynamicvis" ] && [ ! -f "$DYNAMICVIS_CONFIG" ]; then
     echo "Error: DynamicVis config not found: $DYNAMICVIS_CONFIG"
     exit 1
 fi
@@ -188,6 +204,7 @@ echo ""
 echo "Configuration:"
 echo "  Data root:            $DATA_ROOT"
 echo "  Output dir:           $OUTPUT_DIR"
+echo "  Model type:           $MODEL_TYPE"
 echo "  DynamicVis config:    $DYNAMICVIS_CONFIG"
 echo "  Backbone checkpoint:  $BACKBONE_CHECKPOINT"
 echo "  Detector checkpoint:  ${DETECTOR_CHECKPOINT:-none}"
@@ -216,7 +233,7 @@ command -v nvidia-smi &>/dev/null && nvidia-smi
 PY_ARGS=(
     --data-root "$DATA_ROOT"
     --output-dir "$OUTPUT_DIR"
-    --dynamicvis-config "$DYNAMICVIS_CONFIG"
+    --model-type "$MODEL_TYPE"
     --backbone-checkpoint "$BACKBONE_CHECKPOINT"
     --img-size "$IMG_SIZE"
     --fpn-out-channels "$FPN_OUT_CHANNELS"
@@ -231,6 +248,10 @@ PY_ARGS=(
     --score-thresh "$SCORE_THRESH"
     --num-visualize "$NUM_VISUALIZE"
 )
+
+if [ -n "$DYNAMICVIS_CONFIG" ]; then
+    PY_ARGS+=(--dynamicvis-config "$DYNAMICVIS_CONFIG")
+fi
 
 if [ -n "$DETECTOR_CHECKPOINT" ]; then
     PY_ARGS+=(--detector-checkpoint "$DETECTOR_CHECKPOINT")

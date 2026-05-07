@@ -698,7 +698,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model_type",
         type=str,
         default="dynamicvis",
-        choices=["dynamicvis"],
+        choices=["dynamicvis", "prithvi", "prithvi2", "prithvi_v2"],
     )
     parser.add_argument("--model_path", type=str, default=str(DEFAULT_MODEL_PATH))
     parser.add_argument("--config_path", type=str, default=str(DEFAULT_CONFIG_PATH))
@@ -750,6 +750,12 @@ def run(args: argparse.Namespace) -> None:
         if not Path(args.config_path).is_file():
             raise FileNotFoundError(f"DynamicVis config not found: {args.config_path}")
 
+    if args.model_type in {"prithvi", "prithvi2", "prithvi_v2"}:
+        args.in_chans = 3
+        if not Path(args.model_path).is_file():
+            raise FileNotFoundError(f"Prithvi v2 checkpoint not found: {args.model_path}")
+        args.config_path = None
+
     if not Path(args.model_path).is_file():
         raise FileNotFoundError(f"Model checkpoint not found: {args.model_path}")
 
@@ -764,10 +770,13 @@ def run(args: argparse.Namespace) -> None:
     class_to_idx = discover_classes(images_root)
 
     if args.img_size is None:
-        args.img_size = infer_img_size_from_config(args.config_path, fallback=512)
+        if args.model_type == "dynamicvis":
+            args.img_size = infer_img_size_from_config(args.config_path, fallback=512)
+        else:
+            args.img_size = 512
 
     print("=" * 64)
-    print("UC Merced DynamicVis Evaluation")
+    print("UC Merced Foundation Model Evaluation")
     print("=" * 64)
     print(f"Data directory:      {args.data_dir}")
     print(f"Images root:         {images_root}")
@@ -790,8 +799,6 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # create_model returns a frozen foundation encoder that already outputs
-    # pooled feature vectors (DynamicVis out_type='avg_featmap').
     model = create_model(
         model_type=args.model_type,
         model_path=args.model_path,

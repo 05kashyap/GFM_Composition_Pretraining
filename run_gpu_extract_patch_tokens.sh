@@ -78,9 +78,9 @@ done
 # =============================================================================
 # Defaults
 # =============================================================================
-DATA_ROOT="data/fmow"
+DATA_ROOT="/mnt/usb/fmow"
 MANIFEST="data/fmow_manifest_train.json"
-OUTPUT_DIR="outputs/patch_tokens_bovw"
+OUTPUT_DIR="/mnt/usb/patch_tokens_bovw"
 WEIGHTS_PATH="weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
 BATCH_SIZE=64
 NUM_GPUS=8

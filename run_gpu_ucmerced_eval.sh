@@ -16,6 +16,7 @@
 #   sbatch run_gpu_ucmerced_eval.sh --split-mode kfold --num-folds 5
 #   sbatch run_gpu_ucmerced_eval.sh --max-train 1000 --max-test 500
 #   sbatch run_gpu_ucmerced_eval.sh --head-epochs 50 --mlp-hidden-dim 768
+#   sbatch run_gpu_ucmerced_eval.sh --model-type prithvi_v2
 #   sbatch run_gpu_ucmerced_eval.sh --dry-run
 # =============================================================================
 
@@ -109,6 +110,7 @@ NUM_FOLDS=5
 MODEL_TYPE="dynamicvis"
 MODEL_PATH="outputs/bovw_training_8262/epoch_20.pth"
 CONFIG_PATH="architectures/DynamicVis/configs_DynamicVis/UCMerced/dynamicvis_b_uc_mamba.py"
+PRITHVI_MODEL_PATH="weights/Prithvi_EO_V2_600M.pt"
 EMBEDDING_DIM=768
 IMG_SIZE=512
 IN_CHANS=3
@@ -170,6 +172,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ "$MODEL_TYPE" != "prithvi" ] && [ "$MODEL_TYPE" != "prithvi2" ] && [ "$MODEL_TYPE" != "prithvi_v2" ]; then
+    echo "Error: --model-type must be one of: dynamicvis, prithvi, prithvi2, prithvi_v2"
+    exit 1
+fi
+
+if [ "$MODEL_TYPE" = "prithvi" ] || [ "$MODEL_TYPE" = "prithvi2" ] || [ "$MODEL_TYPE" = "prithvi_v2" ]; then
+    if [ "$MODEL_PATH" = "outputs/bovw_training_8262/epoch_20.pth" ]; then
+        MODEL_PATH="$PRITHVI_MODEL_PATH"
+    fi
+    if [ "$EMBEDDING_DIM" = "768" ]; then
+        EMBEDDING_DIM=512
+    fi
+    CONFIG_PATH=""
+fi
+
 if [ "$SPLIT_MODE" != "fixed" ] && [ "$SPLIT_MODE" != "kfold" ]; then
     echo "Error: --split-mode must be one of: fixed, kfold"
     exit 1
@@ -189,6 +206,11 @@ fi
 
 if [ "$MODEL_TYPE" = "dynamicvis" ] && [ ! -f "$CONFIG_PATH" ]; then
     echo "Error: DynamicVis config not found: $CONFIG_PATH"
+    exit 1
+fi
+
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ ! -f "$MODEL_PATH" ]; then
+    echo "Error: Prithvi v2 checkpoint not found: $MODEL_PATH"
     exit 1
 fi
 
@@ -228,7 +250,7 @@ echo "  Val list:         $VAL_LIST"
 echo "  Num folds:        $NUM_FOLDS"
 echo "  Model type:       $MODEL_TYPE"
 echo "  Checkpoint:       $MODEL_PATH"
-echo "  Config:           $CONFIG_PATH"
+echo "  Config:           ${CONFIG_PATH:-n/a}"
 echo "  Embedding dim:    $EMBEDDING_DIM"
 echo "  Image size:       $IMG_SIZE"
 echo "  Batch size:       $BATCH_SIZE"
@@ -265,7 +287,6 @@ PY_ARGS=(
     --num_folds "$NUM_FOLDS"
     --model_type "$MODEL_TYPE"
     --model_path "$MODEL_PATH"
-    --config_path "$CONFIG_PATH"
     --embedding_dim "$EMBEDDING_DIM"
     --img_size "$IMG_SIZE"
     --in_chans "$IN_CHANS"
@@ -280,6 +301,10 @@ PY_ARGS=(
     --head_dropout "$HEAD_DROPOUT"
     --head_log_interval "$HEAD_LOG_INTERVAL"
 )
+
+if [ -n "$CONFIG_PATH" ]; then
+    PY_ARGS+=(--config_path "$CONFIG_PATH")
+fi
 
 if [ -n "$MAX_TRAIN" ]; then
     PY_ARGS+=(--max_train "$MAX_TRAIN")

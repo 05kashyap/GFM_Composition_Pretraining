@@ -1,6 +1,6 @@
-# SatBae
+# Towards Semantically-enriched and Bias-free Geospatial Embeddings
 
-SatBae is a satellite foundation model project built on the DynamicVis backbone.
+A satellite foundation model project built on the DynamicVis backbone.
 The current primary training method is a BoVW-style pipeline on fMoW that distills
 structure from DINOv3 patch tokens into DynamicVis using Sinkhorn EMD supervision.
 
@@ -16,7 +16,7 @@ DynamicVis BoVW training -> downstream transfer (CBIR / UC Merced / LEVIR-CD).
 
 ## fMoW Dataset
 
-SatBae is centered on fMoW with 63 land-use categories. The BoVW pipeline uses
+Uses the fMoW with 63 land-use categories. The BoVW pipeline uses
 cell-level training targets built from DINOv3 patch embeddings.
 
 Expected local layout (after download):

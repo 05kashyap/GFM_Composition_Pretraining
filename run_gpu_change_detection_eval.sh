@@ -14,6 +14,7 @@
 #   sbatch run_gpu_change_detection_eval.sh
 #   sbatch run_gpu_change_detection_eval.sh --epochs 5 --batch-size 4
 #   sbatch run_gpu_change_detection_eval.sh --eval-only --cd-checkpoint outputs/change_detection/best_cd_model.pth
+#   sbatch run_gpu_change_detection_eval.sh --model-type prithvi2 (doesnt work yet)
 #   sbatch run_gpu_change_detection_eval.sh --dry-run
 # =============================================================================
 
@@ -99,8 +100,10 @@ fi
 # -- Defaults --
 DATA_ROOT="data/eval/LEVIR CD"
 OUTPUT_DIR="outputs/change_detection"
+MODEL_TYPE="dynamicvis"
 DYNAMICVIS_CONFIG="architectures/DynamicVis/configs_DynamicVis/LEVIR-CD/dynamicvis_b_2X_levircd_mamba.py"
 BACKBONE_CHECKPOINT="outputs/bovw_training_8262/epoch_20.pth"
+PRITHVI_BACKBONE_CHECKPOINT="weights/Prithvi_EO_V2_600M.pt"
 CD_CHECKPOINT=""
 PATCH_SIZE=512
 STRIDE=512
@@ -125,6 +128,7 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --data-root)            DATA_ROOT="$2"; shift 2 ;;
         --output-dir)           OUTPUT_DIR="$2"; shift 2 ;;
+        --model-type)           MODEL_TYPE="$2"; shift 2 ;;
         --dynamicvis-config)    DYNAMICVIS_CONFIG="$2"; shift 2 ;;
         --backbone-checkpoint)  BACKBONE_CHECKPOINT="$2"; shift 2 ;;
         --cd-checkpoint)        CD_CHECKPOINT="$2"; shift 2 ;;
@@ -149,6 +153,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ "$MODEL_TYPE" != "prithvi" ] && [ "$MODEL_TYPE" != "prithvi2" ] && [ "$MODEL_TYPE" != "prithvi_v2" ]; then
+    echo "Error: --model-type must be one of: dynamicvis, prithvi, prithvi2, prithvi_v2"
+    exit 1
+fi
+
+if [ "$MODEL_TYPE" = "prithvi" ] || [ "$MODEL_TYPE" = "prithvi2" ] || [ "$MODEL_TYPE" = "prithvi_v2" ]; then
+    if [ "$BACKBONE_CHECKPOINT" = "outputs/bovw_training_8262/epoch_20.pth" ]; then
+        BACKBONE_CHECKPOINT="$PRITHVI_BACKBONE_CHECKPOINT"
+    fi
+    DYNAMICVIS_CONFIG=""
+fi
+
 if [ "$MIG_INDEX" -ge "${#MIG_UUIDS[@]}" ] || [ "$MIG_INDEX" -lt 0 ]; then
     echo "Error: --mig-index must be in [0, $(( ${#MIG_UUIDS[@]} - 1 ))]."
     exit 1
@@ -166,8 +182,13 @@ if [ ! -f "$BACKBONE_CHECKPOINT" ]; then
     exit 1
 fi
 
-if [ ! -f "$DYNAMICVIS_CONFIG" ]; then
+if [ "$MODEL_TYPE" = "dynamicvis" ] && [ ! -f "$DYNAMICVIS_CONFIG" ]; then
     echo "Error: DynamicVis config not found: $DYNAMICVIS_CONFIG"
+    exit 1
+fi
+
+if [ "$MODEL_TYPE" != "dynamicvis" ] && [ ! -f "$BACKBONE_CHECKPOINT" ]; then
+    echo "Error: Prithvi v2 checkpoint not found: $BACKBONE_CHECKPOINT"
     exit 1
 fi
 
@@ -180,7 +201,8 @@ echo ""
 echo "Configuration:"
 echo "  Data root:            $DATA_ROOT"
 echo "  Output dir:           $OUTPUT_DIR"
-echo "  DynamicVis config:    $DYNAMICVIS_CONFIG"
+echo "  Model type:           $MODEL_TYPE"
+echo "  DynamicVis config:    ${DYNAMICVIS_CONFIG:-n/a}"
 echo "  Backbone checkpoint:  $BACKBONE_CHECKPOINT"
 echo "  CD checkpoint:        ${CD_CHECKPOINT:-$OUTPUT_DIR/best_cd_model.pth}"
 echo "  Patch size:           $PATCH_SIZE"
@@ -203,7 +225,7 @@ command -v nvidia-smi &>/dev/null && nvidia-smi
 PY_ARGS=(
     --data-root "$DATA_ROOT"
     --output-dir "$OUTPUT_DIR"
-    --dynamicvis-config "$DYNAMICVIS_CONFIG"
+    --model-type "$MODEL_TYPE"
     --backbone-checkpoint "$BACKBONE_CHECKPOINT"
     --patch-size "$PATCH_SIZE"
     --stride "$STRIDE"
@@ -218,6 +240,10 @@ PY_ARGS=(
     --log-every "$LOG_EVERY"
     --num-visualize "$NUM_VISUALIZE"
 )
+
+if [ -n "$DYNAMICVIS_CONFIG" ]; then
+    PY_ARGS+=(--dynamicvis-config "$DYNAMICVIS_CONFIG")
+fi
 
 if [ -n "$CD_CHECKPOINT" ]; then
     PY_ARGS+=(--cd-checkpoint-path "$CD_CHECKPOINT")

@@ -308,5 +308,80 @@ class PrithviEncoderV2(nn.Module):
 
         return F.normalize(embeddings, p=2, dim=1)
 
+    def _tokens_to_feature_map(self, layer_features: torch.Tensor, input_shape: torch.Size) -> torch.Tensor:
+        patch_tokens = layer_features[:, 1:, :]
+        batch_size, num_tokens, channels = patch_tokens.shape
+
+        if len(input_shape) != 5:
+            raise ValueError(f"Expected 5D input shape for Prithvi features, got {tuple(input_shape)}")
+
+        _, _, time, height, width = input_shape
+        patch_t, patch_h, patch_w = self.config['patch_size']
+        num_frames = int(self.config.get('num_frames', 1))
+
+        grid_h = max(1, height // patch_h)
+        grid_w = max(1, width // patch_w)
+        expected_tokens = grid_h * grid_w * max(1, time // max(1, patch_t))
+
+        if expected_tokens != num_tokens:
+            if num_tokens % max(1, num_frames) == 0:
+                tokens_per_frame = num_tokens // max(1, num_frames)
+                side = int(round(tokens_per_frame ** 0.5))
+                if side * side * max(1, num_frames) == num_tokens:
+                    grid_h = side
+                    grid_w = side
+                else:
+                    raise ValueError(
+                        f"Unable to reshape Prithvi tokens into a feature map: tokens={num_tokens}, "
+                        f"expected={expected_tokens}, input_shape={tuple(input_shape)}, "
+                        f"patch_size={self.config['patch_size']}"
+                    )
+            else:
+                raise ValueError(
+                    f"Unable to reshape Prithvi tokens into a feature map: tokens={num_tokens}, "
+                    f"expected={expected_tokens}, input_shape={tuple(input_shape)}, "
+                    f"patch_size={self.config['patch_size']}"
+                )
+
+        return patch_tokens.transpose(1, 2).contiguous().view(batch_size, channels, grid_h, grid_w)
+
+    def forward_feature_maps(
+        self,
+        x: torch.Tensor,
+        layer_indices: Optional[List[int]] = None,
+        pyramid_scales: Optional[List[int]] = None,
+    ) -> List[torch.Tensor]:
+        if x.dim() == 4:
+            x = x.unsqueeze(2)
+
+        features = self.backbone.forward_features(x)
+        selected_indices = layer_indices if layer_indices is not None else self.layer_indices
+        if not selected_indices:
+            raise ValueError("layer_indices must contain at least one index.")
+
+        maps: List[torch.Tensor] = []
+        total_layers = len(features)
+        for layer_idx in selected_indices:
+            idx = layer_idx if layer_idx >= 0 else total_layers + layer_idx
+            if idx < 0 or idx >= total_layers:
+                raise IndexError(
+                    f"Layer index {layer_idx} is out of bounds for feature map list of length {total_layers}."
+                )
+            maps.append(self._tokens_to_feature_map(features[idx], x.shape))
+
+        if pyramid_scales is None:
+            pyramid_scales = [2 ** i for i in range(len(maps))]
+
+        pyramid_maps: List[torch.Tensor] = []
+        base_h, base_w = maps[0].shape[-2:]
+        for feat_map, scale in zip(maps, pyramid_scales):
+            target_h = max(1, base_h // max(1, scale))
+            target_w = max(1, base_w // max(1, scale))
+            if feat_map.shape[-2:] != (target_h, target_w):
+                feat_map = F.adaptive_avg_pool2d(feat_map, (target_h, target_w))
+            pyramid_maps.append(feat_map)
+
+        return pyramid_maps
+
     def get_embedding_dim(self) -> int:
         return self.embedding_dim

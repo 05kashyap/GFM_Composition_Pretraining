@@ -29,6 +29,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+from eval.adapters.prithvi_v2_adapter import PrithviEncoderV2
+
 warnings.filterwarnings("ignore")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -37,6 +39,7 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_DATA_ROOT = REPO_ROOT / "data" / "eval" / "LEVIR CD"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "outputs" / "change_detection"
 DEFAULT_BACKBONE_WEIGHTS = REPO_ROOT / "outputs" / "bovw_training_8262" / "epoch_20.pth"
+DEFAULT_PRITHVI_WEIGHTS = REPO_ROOT / "weights" / "Prithvi_EO_V2_600M.pt"
 DEFAULT_DYNVIS_CONFIG = (
     REPO_ROOT
     / "architectures"
@@ -439,6 +442,32 @@ class BackboneWrapper(nn.Module):
         return self.backbone(x)
 
 
+class PrithviBackboneWrapper(nn.Module):
+    """Prithvi v2 backbone wrapper returning four feature maps for the CD neck."""
+
+    def __init__(self, img_size: int, backbone_checkpoint: str | None = None):
+        super().__init__()
+        self.expected_img_size = int(img_size)
+        self.layer_indices = [-4, -3, -2, -1]
+        self.backbone = PrithviEncoderV2(
+            model_path=backbone_checkpoint or str(DEFAULT_PRITHVI_WEIGHTS),
+            embedding_dim=512,
+            img_size=img_size,
+            in_chans=3,
+        )
+        self.out_channels = [self.backbone.feature_dim] * len(self.layer_indices)
+
+    def forward(self, x: torch.Tensor):
+        h, w = x.shape[-2:]
+        if h != self.expected_img_size or w != self.expected_img_size:
+            raise ValueError(
+                "Input resolution does not match Prithvi v2 img_size: "
+                f"got ({h}, {w}), expected "
+                f"({self.expected_img_size}, {self.expected_img_size})."
+            )
+        return self.backbone.forward_feature_maps(x, layer_indices=self.layer_indices)
+
+
 class FPNNeck(nn.Module):
     def __init__(self, in_channels_list: List[int], out_channels: int = 256):
         super().__init__()
@@ -488,17 +517,25 @@ class ChangeDetectionHead(nn.Module):
 class ChangeDetectionModel(nn.Module):
     def __init__(
         self,
+        model_type: str,
         dynamicvis_config: str,
         img_size: int,
         fpn_out_channels: int,
         backbone_checkpoint: str | None,
     ):
         super().__init__()
-        self.backbone = BackboneWrapper(
-            dynamicvis_config=dynamicvis_config,
-            img_size=img_size,
-            backbone_checkpoint=backbone_checkpoint,
-        )
+        self.model_type = model_type
+        if model_type == "dynamicvis":
+            self.backbone = BackboneWrapper(
+                dynamicvis_config=dynamicvis_config,
+                img_size=img_size,
+                backbone_checkpoint=backbone_checkpoint,
+            )
+        else:
+            self.backbone = PrithviBackboneWrapper(
+                img_size=img_size,
+                backbone_checkpoint=backbone_checkpoint,
+            )
         self.fpn = FPNNeck(self.backbone.out_channels, out_channels=fpn_out_channels)
         self.head = ChangeDetectionHead(in_channels=fpn_out_channels)
 
@@ -699,6 +736,7 @@ def train(args: argparse.Namespace, device: torch.device):
     print(f"Test patches:  {len(test_ds)}")
 
     model = ChangeDetectionModel(
+            model_type=args.model_type,
         dynamicvis_config=args.dynamicvis_config,
         img_size=args.patch_size,
         fpn_out_channels=args.fpn_out_channels,
@@ -801,6 +839,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=str, default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
 
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default="dynamicvis",
+        choices=["dynamicvis", "prithvi", "prithvi2", "prithvi_v2"],
+    )
+
     parser.add_argument("--dynamicvis-config", type=str, default=str(DEFAULT_DYNVIS_CONFIG))
     parser.add_argument("--backbone-checkpoint", type=str, default=str(DEFAULT_BACKBONE_WEIGHTS))
 
@@ -836,13 +881,18 @@ def main() -> None:
     args.output_dir = str(Path(args.output_dir))
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
+    if args.model_type in {"prithvi", "prithvi2", "prithvi_v2"} and args.backbone_checkpoint == str(DEFAULT_BACKBONE_WEIGHTS):
+        args.backbone_checkpoint = str(DEFAULT_PRITHVI_WEIGHTS)
+
     if not args.cd_checkpoint_path:
         args.cd_checkpoint_path = str(Path(args.output_dir) / "best_cd_model.pth")
 
     if not Path(args.data_root).exists():
         raise FileNotFoundError(f"Data root not found: {args.data_root}")
-    if not Path(args.dynamicvis_config).exists():
+    if args.model_type == "dynamicvis" and not Path(args.dynamicvis_config).exists():
         raise FileNotFoundError(f"DynamicVis config not found: {args.dynamicvis_config}")
+    if not Path(args.backbone_checkpoint).exists():
+        raise FileNotFoundError(f"Backbone checkpoint not found: {args.backbone_checkpoint}")
 
     seed_everything(args.seed)
 
@@ -859,6 +909,7 @@ def main() -> None:
             pin_memory=torch.cuda.is_available(),
         )
         model = ChangeDetectionModel(
+            model_type=args.model_type,
             dynamicvis_config=args.dynamicvis_config,
             img_size=args.patch_size,
             fpn_out_channels=args.fpn_out_channels,

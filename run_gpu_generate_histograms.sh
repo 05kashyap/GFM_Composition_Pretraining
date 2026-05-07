@@ -56,12 +56,12 @@ conda activate dynamicvis
 # =============================================================================
 # Defaults
 # =============================================================================
-PATCH_TOKEN_DIR="outputs/patch_tokens_bovw"
-VOCAB_DIR="outputs/bovw_vocabulary"
+PATCH_TOKEN_DIR="/mnt/usb/patch_tokens_bovw"
+VOCAB_DIR="/mnt/usb/bovw_vocabulary"
 MANIFEST="data/fmow_manifest_train.json"
-OUTPUT_DIR="outputs/bovw_histograms"
+OUTPUT_DIR="/mnt/usb/bovw_histograms"
 WEIGHTS_PATH="weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
-DATA_ROOT="data/fmow"
+DATA_ROOT="/mnt/usb/fmow"
 BETA=10.0
 WORKERS=8
 RESUME="--resume"

@@ -1,4 +1,4 @@
-# SatBae — Codebase Context
+# Codebase Context
 
 > A foundation model for satellite imagery built on the DynamicVis backbone with two primary training methodologies: **vanilla pretraining** (region-based classification) and **BoVW training** (Bag of Visual Words histogram prediction using Sinkhorn EMD).
 
@@ -7,7 +7,7 @@
 ## 1. Project Structure
 
 ```
-SatBae/
+root/
 ├── architectures/DynamicVis/          # Upstream DynamicVis fork
 │   └── dynamicvis/models/models.py    # Backbone, MambaBlock, SpatialSparseMixer, PretrainClsHead
 ├── configs_dynamicvis/

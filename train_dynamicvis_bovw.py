@@ -144,6 +144,10 @@ def parse_args() -> argparse.Namespace:
                    help="Log every N iterations")
     p.add_argument("--save-interval", type=int, default=10,
                    help="Save checkpoint every N epochs")
+    p.add_argument("--resume-from", type=str, default=None,
+                   help="Path to checkpoint to resume training from")
+    p.add_argument("--reset-optim-on-resume", action="store_true",
+                   help="Resume model weights but reinitialize optimizer/scaler state")
 
     # W&B
     p.add_argument("--wandb-project", type=str, default="satbae-bovw",
@@ -238,6 +242,93 @@ def load_pretrained_backbone(model: nn.Module, checkpoint_path: str, rank: int =
             print(f"  Missing keys: {len(missing)}")
         if unexpected:
             print(f"  Unexpected keys: {len(unexpected)}")
+
+
+def resume_training_state(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    scaler: GradScaler,
+    resume_path: Optional[str],
+    current_world_size: int = 1,
+    current_batch_size: int = 1,
+    reset_optim_on_resume: bool = False,
+    rank: int = 0,
+) -> tuple[int, float]:
+    """Resume model and optimizer/scheduler/scaler states from a checkpoint."""
+    if not resume_path:
+        return 0, float('inf')
+
+    ckpt_path = Path(resume_path)
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {resume_path}")
+
+    if rank == 0:
+        print(f"Resuming training from checkpoint: {resume_path}")
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+        raise ValueError("Resume checkpoint must be a dict containing 'state_dict'.")
+
+    # Checkpoints are saved from the raw model, not the DDP wrapper.
+    # Load into the unwrapped module so keys match exactly.
+    raw_model = model.module if hasattr(model, "module") else model
+
+    missing, unexpected = raw_model.load_state_dict(ckpt["state_dict"], strict=False)
+    if rank == 0:
+        print(f"  Model state loaded. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
+    ckpt_world_size = ckpt.get("world_size")
+    ckpt_batch_size = ckpt.get("batch_size")
+    restore_optimizer_state = True
+    restore_scaler_state = True
+    if reset_optim_on_resume:
+        restore_optimizer_state = False
+        restore_scaler_state = False
+        if rank == 0:
+            print("  --reset-optim-on-resume set: skipping optimizer and scaler restore")
+    elif ckpt_world_size is not None and ckpt_batch_size is not None:
+        if ckpt_world_size != current_world_size or ckpt_batch_size != current_batch_size:
+            restore_optimizer_state = False
+            restore_scaler_state = False
+            if rank == 0:
+                print(
+                    "  Warning: checkpoint was created with "
+                    f"world_size={ckpt_world_size}, batch_size={ckpt_batch_size}; "
+                    f"current run uses world_size={current_world_size}, batch_size={current_batch_size}."
+                )
+                print("  Skipping optimizer and scaler restore to avoid stale state.")
+
+    if "scheduler" in ckpt:
+        scheduler.load_state_dict(ckpt["scheduler"])
+        if rank == 0:
+            print("  Scheduler state restored")
+    elif rank == 0:
+        print("  Warning: Scheduler state missing in checkpoint")
+
+    if restore_optimizer_state:
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            if rank == 0:
+                print("  Optimizer state restored")
+        elif rank == 0:
+            print("  Warning: Optimizer state missing in checkpoint")
+
+    if restore_scaler_state and "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+        if rank == 0:
+            print("  GradScaler state restored")
+    elif rank == 0 and not restore_scaler_state:
+        print("  GradScaler state will be reinitialized for this run")
+
+    start_epoch = int(ckpt.get("epoch", 0))
+    best_loss = float(ckpt.get("loss", float('inf')))
+    if rank == 0:
+        print(f"  Resume epoch: {start_epoch}")
+        print(f"  Best/current loss from checkpoint: {best_loss:.4f}")
+
+    return start_epoch, best_loss
 
 
 def train_one_epoch(
@@ -510,10 +601,20 @@ def main():
     # Create grad scaler for AMP
     scaler = GradScaler()
 
-    # Training loop
+    # Optionally resume full training state
+    start_epoch = 0
     best_loss = float('inf')
+    if args.resume_from:
+        start_epoch, best_loss = resume_training_state(
+            model, optimizer, scheduler, scaler, args.resume_from,
+            current_world_size=world_size,
+            current_batch_size=args.batch_size,
+            reset_optim_on_resume=args.reset_optim_on_resume,
+            rank=rank,
+        )
 
-    for epoch in range(args.num_epochs):
+    # Training loop
+    for epoch in range(start_epoch, args.num_epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
 
@@ -550,6 +651,10 @@ def main():
                     "loss": avg_loss,
                     "optimizer": optimizer.state_dict(),
                     "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "world_size": world_size,
+                    "batch_size": args.batch_size,
+                    "effective_batch_size": args.batch_size * world_size,
                 }
 
                 if avg_loss < best_loss:
