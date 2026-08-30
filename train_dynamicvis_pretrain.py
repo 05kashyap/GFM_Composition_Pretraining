@@ -89,6 +89,13 @@ def parse_args():
     parser.add_argument('--max-samples', type=int, help='Limit training samples (for debugging)')
     parser.add_argument('--use-rgb', action='store_true', help='Use full RGB images (larger) instead of msrgb')
     parser.add_argument('--data-root', type=str, help='Local data directory (downloaded via scripts/download_fmow.py)')
+    parser.add_argument(
+        '--dist-backend',
+        type=str,
+        choices=['nccl', 'gloo'],
+        default=None,
+        help='Override distributed backend (nccl for <=2 MIG slices, gloo for >2)'
+    )
     
     args = parser.parse_args()
     
@@ -117,6 +124,12 @@ def merge_args(cfg, args):
         cfg.val_evaluator = None
     
     cfg.launcher = args.launcher
+    
+    # Override distributed backend (nccl vs gloo)
+    if args.dist_backend is not None:
+        cfg.env_cfg.dist_cfg = dict(backend=args.dist_backend)
+        if args.dist_backend == 'gloo':
+            print(f"Using gloo backend (CPU-based collectives for multi-MIG DDP)")
     
     # Work directory
     if args.work_dir is not None:

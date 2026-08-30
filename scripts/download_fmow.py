@@ -229,7 +229,7 @@ def download_dataset(
     print()
     
     # Confirm
-    response = input("Proceed with download? [y/N]: ")
+    response = "y"#input("Proceed with download? [y/N]: ")
     if response.lower() != 'y':
         print("Aborted.")
         return
