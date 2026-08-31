@@ -1,8 +1,22 @@
 # A Composition-Aware Pretraining Framework for Geospatial Foundation Models
 
-Geospatial foundation models have emerged as state-of-the-art methods for downstream Earth observation tasks. However, existing pretraining methodologies process imagery through a single-concept lens, failing to capture the highly compositional nature of complex satellite scenes. We propose a composition-aware pretraining framework that explicitly encodes fractional land-cover mixtures. Each satellite image cell is mapped to a histogram representing its fractional land-cover distribution, which we term the "composition target". These targets serve as the primary prediction objective and are distilled into the backbone using Earth Mover's Distance. Experimental evaluation shows that composition-aware pretraining yields substantial gains on region-level understanding tasks requiring semantic similarity judgment, including zero-shot image retrieval and scene classification, while remaining competitive on tasks requiring fine-grained spatial precision, such as segmentation and object detection.
+[![Paper](https://img.shields.io/badge/Paper-SIGSPATIAL%202026-blue)](#citation)
+[![License](https://img.shields.io/badge/License-MIT-green)](#license)
+
+Official code release for our SIGSPATIAL '26 short paper. This repository implements a composition-aware pretraining framework for geospatial foundation models: each satellite image cell is mapped to a histogram describing its fractional land-cover makeup (the **composition target**), which is distilled into the backbone via Earth Mover's Distance. This encourages the model to reason about scenes as mixtures of land-cover types rather than single dominant concepts, yielding strong gains on region-level understanding tasks (zero-shot retrieval, scene classification) while remaining competitive on pixel-level tasks (segmentation, detection).
 
 ![Methodology](figures/Methodology_Short.png)
+
+## Table of Contents
+
+- [Installation](#installation)
+- [Dataset](#fmow-dataset)
+- [Pretraining](#pretraining)
+- [Downstream Evaluation](#downstream-evaluation-eval)
+- [Other Training Modes](#other-training-modes)
+- [Citation](#citation)
+- [License](#license)
+- [Acknowledgments](#acknowledgments)
 
 ## Installation
 
@@ -17,9 +31,7 @@ conda activate dynamicvis
 
 ### 2. DynamicVis dependency
 
-Training and evaluation scripts import the
-[DynamicVis](https://github.com/KyanChen/DynamicVis) codebase, which is kept out
-of this repository. Clone it into `architectures/`:
+Training and evaluation scripts import the [DynamicVis](https://github.com/KyanChen/DynamicVis) codebase, which is kept out of this repository. Clone it into `architectures/`:
 
 ```bash
 git clone https://github.com/KyanChen/DynamicVis.git architectures/DynamicVis
@@ -27,8 +39,7 @@ git clone https://github.com/KyanChen/DynamicVis.git architectures/DynamicVis
 
 ### 3. PYTHONPATH
 
-Scripts import from both the repository root and `architectures/DynamicVis`.
-Export PYTHONPATH (add it to `~/.bashrc` to persist):
+Scripts import from both the repository root and `architectures/DynamicVis`. Export `PYTHONPATH` (add it to `~/.bashrc` to persist across sessions):
 
 ```bash
 export PYTHONPATH="$(pwd):$(pwd)/architectures/DynamicVis:${PYTHONPATH:-}"
@@ -36,36 +47,32 @@ export PYTHONPATH="$(pwd):$(pwd)/architectures/DynamicVis:${PYTHONPATH:-}"
 
 ### 4. Model weights
 
-The `weights/` directory is git-ignored, so download any checkpoints you need
-and place them there:
+The `weights/` directory is git-ignored — download any checkpoints you need and place them there:
 
-- **DINOv3 ViT-L/16** — required for BoVW patch-token extraction (Phase 1) and
-  histogram generation (Phase 3). Defaults to
-  `weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth`; override with
-  `--weights-path`.
-- **DynamicVis backbone** — optional for BoVW training (Phase 4). Pass it with
-  `--pretrained-backbone`, or train from scratch with `--no-pretrained`.
+| Checkpoint | Required for | Default path | Override flag |
+|---|---|---|---|
+| DINOv3 ViT-L/16 | BoVW patch-token extraction (Phase 1) and histogram generation (Phase 3) | `weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth` | `--weights-path` |
+| DynamicVis backbone | Optional warm start for BoVW training (Phase 4) | — | `--pretrained-backbone` (or `--no-pretrained` to train from scratch) |
 
 ### 5. Weights & Biases (optional)
 
-Training scripts log to W&B by default. Set `WANDB_API_KEY` (optionally also
-`WANDB_PROJECT` / `WANDB_ENTITY`) in the environment, or pass `--no-wandb` to
-disable logging.
+Training scripts log to W&B by default. Set `WANDB_API_KEY` (optionally also `WANDB_PROJECT` / `WANDB_ENTITY`) in your environment, or pass `--no-wandb` to disable logging.
 
 ## fMoW Dataset
 
-Uses the fMoW with 63 land-use categories. The BoVW pipeline uses
-cell-level training targets built from DINOv3 patch embeddings.
+We use fMoW, categorized into 62 land-use classes. The BoVW pipeline builds cell-level training targets from DINOv3 patch embeddings.
 
-Expected local layout (after download):
+Expected local layout after download:
+
 ```
 data/fmow/train/<category>/<location>/*.jpg
 data/fmow/val/<category>/<location>/*.jpg
 ```
-Common manifests already in this repository:
 
-- data/fmow_manifest_train.json
-- data/fmow_manifest_val.json
+Manifests already included in this repository:
+
+- `data/fmow_manifest_train.json`
+- `data/fmow_manifest_val.json`
 
 Download examples:
 
@@ -83,15 +90,11 @@ python scripts/download_fmow.py --output-dir data/fmow --split train --use-rgb
 python scripts/download_fmow.py --output-dir data/fmow --split val --fraction 0.5
 ```
 
-Notes:
+> **Note:** `download_fmow.py` defaults to multispectral RGB (`msrgb`) unless `--use-rgb` is passed. Keep the manifest and local data layout consistent across all BoVW phases.
 
-- download_fmow.py defaults to msrgb unless --use-rgb is provided.
-- Keep manifest and local data layout consistent across BoVW phases.
+## Pretraining
 
-
-### Pretraining
-
-Run the following in order.
+Run the following phases in order.
 
 ```bash
 # Phase 1: extract DINOv3 patch tokens from fMoW cells
@@ -103,7 +106,7 @@ python scripts/extract_patch_tokens.py \
     --batch-size 64 \
     --resume
 
-# Phase 2: build visual vocabulary with FAISS k-means
+# Phase 2: build the visual vocabulary with FAISS k-means
 python scripts/build_vocabulary.py \
     --patch-token-dir outputs/patch_tokens_bovw \
     --output-dir outputs/bovw_vocabulary \
@@ -127,7 +130,7 @@ python scripts/extract_manifest_labels.py \
     --manifest data/fmow_manifest_train.json \
     --output-dir outputs/bovw_histograms
 
-# Phase 4: train DynamicVis with BoVW objective
+# Phase 4: train DynamicVis with the composition-aware objective
 python train_dynamicvis_bovw.py \
     --manifest data/fmow_manifest_train.json \
     --histogram-dir outputs/bovw_histograms \
@@ -140,41 +143,31 @@ python train_dynamicvis_bovw.py \
     --lr 5e-4
 ```
 
-Notes:
+**Notes:**
 
-- Phase 1 runs in a single process by default. To shard extraction across
-  multiple GPUs, launch one process per GPU with `--shard-index <i>` and
-  `--num-shards <N>`.
-- For multi-GPU Phase 4 training, prefix the command with
-  `torchrun --nproc_per_node=<N> train_dynamicvis_bovw.py ...`.
+- Phase 1 runs in a single process by default. To shard extraction across multiple GPUs, launch one process per GPU with `--shard-index <i>` and `--num-shards <N>`.
+- For multi-GPU Phase 4 training, prefix the command with `torchrun --nproc_per_node=<N> train_dynamicvis_bovw.py ...`.
 - Everything above is plain Python — no Slurm cluster is required.
 
 ### Phase Outputs
 
 | Phase | Script | Main Outputs |
 |---|---|---|
-| 1 | scripts/extract_patch_tokens.py | outputs/patch_tokens_bovw/*.npz |
-| 2 | scripts/build_vocabulary.py | outputs/bovw_vocabulary/centroids.npy, ground_cost.npy |
-| 3 | scripts/generate_histograms.py | outputs/bovw_histograms/histograms.npy, cell_ids.npy |
-| 3b | scripts/extract_manifest_labels.py | outputs/bovw_histograms/cell_labels.npy |
-| 4 | train_dynamicvis_bovw.py | outputs/bovw_training*/final_model.pth, final_backbone.pth |
+| 1 | `scripts/extract_patch_tokens.py` | `outputs/patch_tokens_bovw/*.npz` |
+| 2 | `scripts/build_vocabulary.py` | `outputs/bovw_vocabulary/centroids.npy`, `ground_cost.npy` |
+| 3 | `scripts/generate_histograms.py` | `outputs/bovw_histograms/histograms.npy`, `cell_ids.npy` |
+| 3b | `scripts/extract_manifest_labels.py` | `outputs/bovw_histograms/cell_labels.npy` |
+| 4 | `train_dynamicvis_bovw.py` | `outputs/bovw_training*/final_model.pth`, `final_backbone.pth` |
 
+## Downstream Evaluation (`eval/`)
 
-## Downstream Evaluation (eval/)
+All evaluation scripts freeze the pretrained backbone and train only a lightweight, task-specific head, so reported numbers reflect representation quality rather than fine-tuning capacity.
 
-### 1) CBIR Retrieval (AID / ForestNet)
+### 1. CBIR Retrieval (AID / ForestNet)
 
-Entry point:
+**Entry point:** `eval/cbir/main.py`
 
-- eval/cbir/main.py
-
-What it does:
-
-- Extracts embeddings with the model adapter in eval/adapters/.
-- Builds or loads a FAISS index.
-- Reports Recall@K and mAP@K.
-
-Run commands:
+Extracts embeddings via the model adapter in `eval/adapters/`, builds or loads a FAISS index, and reports Recall@K and mAP@K.
 
 ```bash
 # AID retrieval (stratified k-fold)
@@ -192,20 +185,11 @@ python eval/cbir/main.py \
     --config_path architectures/DynamicVis/configs_DynamicVis/AID/dynamicvis_b_aid_mamba.py
 ```
 
-### 2) UC Merced Scene Classification
+### 2. UC Merced Scene Classification
 
-Entry point:
+**Entry point:** `eval/ucmerced/main.py`
 
-- eval/ucmerced/main.py
-
-What it does:
-
-- Freezes the foundation backbone.
-- Extracts pooled features.
-- Trains a lightweight linear/MLP head.
-- Reports Top-1/Top-5, precision, recall, F1.
-
-Run commands:
+Freezes the backbone, extracts pooled features, trains a lightweight linear/MLP head, and reports Top-1/Top-5 accuracy, precision, recall, and F1.
 
 ```bash
 # Fixed split
@@ -220,19 +204,11 @@ python eval/ucmerced/main.py \
     --num_folds 5
 ```
 
-### 3) LEVIR-CD Change Detection
+### 3. LEVIR-CD Change Detection
 
-Entry point:
+**Entry point:** `eval/change-detection/main.py`
 
-- eval/change-detection/main.py
-
-What it does:
-
-- Uses DynamicVis as a Siamese feature backbone.
-- Adds an FPN-style fusion neck and CD prediction head.
-- Trains/evaluates on LEVIR-CD with precision/recall/F1/IoU metrics.
-
-Run commands:
+Uses DynamicVis as a Siamese feature backbone, adds an FPN-style fusion neck and a change-detection head, and trains/evaluates on LEVIR-CD with precision, recall, F1, and IoU.
 
 ```bash
 # Train + evaluate
@@ -240,35 +216,27 @@ python eval/change-detection/main.py \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
     --num-epochs 5
 
-# Evaluate only from saved CD checkpoint
+# Evaluate only, from a saved CD checkpoint
 python eval/change-detection/main.py \
     --eval-only \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
     --cd-checkpoint-path outputs/change_detection/best_cd_model.pth
 ```
 
-### 4) LEVIR-ship Object Detection
+### 4. LEVIR-Ship Object Detection
 
-Entry point:
+**Entry point:** `eval/object-detection/main.py`
 
-- eval/object-detection/main.py
-
-What it does:
-
-- Uses DynamicVis (loaded from BoVW checkpoints) as the Faster R-CNN backbone.
-- Trains/evaluates on LEVIR-ship YOLO-format labels.
-- Reports mAP at multiple IoU thresholds and saves prediction visualizations.
-
-Run commands:
+Uses DynamicVis (loaded from BoVW checkpoints) as the Faster R-CNN backbone, trains/evaluates on LEVIR-Ship YOLO-format labels, and reports mAP at multiple IoU thresholds along with prediction visualizations.
 
 ```bash
-# Train + evaluate on LEVIR-ship
+# Train + evaluate on LEVIR-Ship
 python eval/object-detection/main.py \
     --data-root data/eval/object-det \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
     --num-epochs 5
 
-# Evaluate only from a saved detector checkpoint
+# Evaluate only, from a saved detector checkpoint
 python eval/object-detection/main.py \
     --eval-only \
     --data-root data/eval/object-det \
@@ -276,21 +244,32 @@ python eval/object-detection/main.py \
     --detector-checkpoint outputs/object_detection/best_detector.pth
 ```
 
-
-
 ## Other Training Modes
 
-- Vanilla pretrain (bbox-supervised DynamicVis):
+**Vanilla pretraining (bbox-supervised DynamicVis)** — for comparison against the composition-aware objective:
 
-  ```bash
-  python train_dynamicvis_pretrain.py configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py \
-      --work-dir outputs/fmow_dynamicvis_b_s3 \
-      --batch-size 128 \
-      --epochs 100 \
-      --lr 1e-4
-  ```
+```bash
+python train_dynamicvis_pretrain.py configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py \
+    --work-dir outputs/fmow_dynamicvis_b_s3 \
+    --batch-size 128 \
+    --epochs 100 \
+    --lr 1e-4
+```
 
-  For multi-GPU training, prefix with `torchrun --nproc_per_node=<N>` and add
-  `--launcher pytorch`.
+For multi-GPU training, prefix with `torchrun --nproc_per_node=<N>` and add `--launcher pytorch`.
 
+## Citation
+ADD
+If you find this work useful, please cite:
 
+```bibtex
+
+```
+
+## License
+
+<!-- TODO: confirm and link the license this repository is released under (e.g., MIT, Apache-2.0). -->
+
+## Acknowledgments
+
+This work builds on [DynamicVis](https://github.com/KyanChen/DynamicVis) and [DINOv3](https://github.com/facebookresearch/dinov3). We thank the authors of both projects for releasing their code and pretrained weights.
