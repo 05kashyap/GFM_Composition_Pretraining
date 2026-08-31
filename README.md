@@ -1,4 +1,4 @@
-# Towards Semantically-enriched and Bias-free Geospatial Embeddings
+# A Composition-Aware Pretraining Framework for Geospatial Foundation Models
 
 A satellite foundation model project built on the DynamicVis backbone.
 The current primary training method is a BoVW-style pipeline on fMoW that distills
