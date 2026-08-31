@@ -1,18 +1,56 @@
 # A Composition-Aware Pretraining Framework for Geospatial Foundation Models
 
-A satellite foundation model project built on the DynamicVis backbone.
-The current primary training method is a BoVW-style pipeline on fMoW that distills
-structure from DINOv3 patch tokens into DynamicVis using Sinkhorn EMD supervision.
+Geospatial foundation models have emerged as state-of-the-art methods for downstream Earth observation tasks. However, existing pretraining methodologies process imagery through a single-concept lens, failing to capture the highly compositional nature of complex satellite scenes. We propose a composition-aware pretraining framework that explicitly encodes fractional land-cover mixtures. Each satellite image cell is mapped to a histogram representing its fractional land-cover distribution, which we term the "composition target". These targets serve as the primary prediction objective and are distilled into the backbone using Earth Mover's Distance. Experimental evaluation shows that composition-aware pretraining yields substantial gains on region-level understanding tasks requiring semantic similarity judgment, including zero-shot image retrieval and scene classification, while remaining competitive on tasks requiring fine-grained spatial precision, such as segmentation and object detection.
 
-- Primary method: BoVW DynamicVis training on fMoW (implemented and actively used).
-- In-domain support: fMoW evaluation scripts for both simplified and pretrain-style heads.
-- Downstream support: retrieval, scene classification, and change detection under eval/.
-- Experimental/legacy paths still present: vanilla bbox pretraining and QSACL composition work.
+![Methodology](figures/Methodology_Short.png)
 
-## Methodology Diagram
+## Installation
 
-fMoW cells -> DINOv3 patch tokens -> visual vocabulary -> soft histograms ->
-DynamicVis BoVW training -> downstream transfer (CBIR / UC Merced / LEVIR-CD).
+### 1. Environment
+
+The conda environment (Python 3.11 + CUDA 12.1) is pinned in `environment.yaml`:
+
+```bash
+conda env create -f environment.yaml
+conda activate dynamicvis
+```
+
+### 2. DynamicVis dependency
+
+Training and evaluation scripts import the
+[DynamicVis](https://github.com/KyanChen/DynamicVis) codebase, which is kept out
+of this repository. Clone it into `architectures/`:
+
+```bash
+git clone https://github.com/KyanChen/DynamicVis.git architectures/DynamicVis
+```
+
+### 3. PYTHONPATH
+
+Scripts import from both the repository root and `architectures/DynamicVis`.
+Export PYTHONPATH (add it to `~/.bashrc` to persist):
+
+```bash
+export PYTHONPATH="$(pwd):$(pwd)/architectures/DynamicVis:${PYTHONPATH:-}"
+```
+
+### 4. Model weights
+
+The `weights/` directory is git-ignored, so download any checkpoints you need
+and place them there:
+
+- **DINOv3 ViT-L/16** — required for BoVW patch-token extraction (Phase 1) and
+  histogram generation (Phase 3). Defaults to
+  `weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth`; override with
+  `--weights-path`.
+- **DynamicVis backbone** — optional for BoVW training (Phase 4). Pass it with
+  `--pretrained-backbone`, or train from scratch with `--no-pretrained`.
+
+### 5. Weights & Biases (optional)
+
+Training scripts log to W&B by default. Set `WANDB_API_KEY` (optionally also
+`WANDB_PROJECT` / `WANDB_ENTITY`) in the environment, or pass `--no-wandb` to
+disable logging.
 
 ## fMoW Dataset
 
@@ -20,10 +58,10 @@ Uses the fMoW with 63 land-use categories. The BoVW pipeline uses
 cell-level training targets built from DINOv3 patch embeddings.
 
 Expected local layout (after download):
-
+```
 data/fmow/train/<category>/<location>/*.jpg
 data/fmow/val/<category>/<location>/*.jpg
-
+```
 Common manifests already in this repository:
 
 - data/fmow_manifest_train.json
@@ -50,41 +88,39 @@ Notes:
 - download_fmow.py defaults to msrgb unless --use-rgb is provided.
 - Keep manifest and local data layout consistent across BoVW phases.
 
-## Novel BoVW Pipeline
 
-The implemented pipeline learns a DynamicVis backbone to predict BoVW histogram
-targets produced from DINOv3 patch tokens.
-
-Loss used in training:
-
-L_total = lambda_emd * L_emd + lambda_cls * L_cls + lambda_mil * L_mil
-
-Where:
-
-- L_emd: Sinkhorn EMD between predicted and target histograms.
-- L_cls: auxiliary label-smoothed classification loss.
-- L_mil: CLIP-style bidirectional MIL contrastive loss.
-
-### End-to-End Quick Start (BoVW)
+### Pretraining
 
 Run the following in order.
 
 ```bash
 # Phase 1: extract DINOv3 patch tokens from fMoW cells
-sbatch run_gpu_extract_patch_tokens.sh \
+python scripts/extract_patch_tokens.py \
+    --data-root data/fmow \
     --manifest data/fmow_manifest_train.json \
-    --num-gpus 8
+    --output-dir outputs/patch_tokens_bovw \
+    --weights-path weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth \
+    --batch-size 64 \
+    --resume
 
 # Phase 2: build visual vocabulary with FAISS k-means
-sbatch run_gpu_build_vocabulary.sh \
+python scripts/build_vocabulary.py \
     --patch-token-dir outputs/patch_tokens_bovw \
+    --output-dir outputs/bovw_vocabulary \
     --K 512 \
     --subsample 5000000
 
 # Phase 3: generate soft histogram targets
-sbatch run_gpu_generate_histograms.sh \
+python scripts/generate_histograms.py \
+    --patch-token-dir outputs/patch_tokens_bovw \
+    --vocab-dir outputs/bovw_vocabulary \
     --manifest data/fmow_manifest_train.json \
-    --output-dir outputs/bovw_histograms
+    --output-dir outputs/bovw_histograms \
+    --weights-path weights/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth \
+    --data-root data/fmow \
+    --beta 10.0 \
+    --workers 8 \
+    --resume
 
 # Phase 3b: derive per-cell class labels from manifest paths
 python scripts/extract_manifest_labels.py \
@@ -92,91 +128,45 @@ python scripts/extract_manifest_labels.py \
     --output-dir outputs/bovw_histograms
 
 # Phase 4: train DynamicVis with BoVW objective
-sbatch run_gpu_bovw_training.sh \
+python train_dynamicvis_bovw.py \
     --manifest data/fmow_manifest_train.json \
     --histogram-dir outputs/bovw_histograms \
     --vocab-dir outputs/bovw_vocabulary \
     --cell-labels outputs/bovw_histograms/cell_labels.npy \
-    --epochs 100 \
+    --data-root data/fmow \
+    --output-dir outputs/bovw_training \
     --batch-size 32 \
-    --num-gpus 8
+    --num-epochs 100 \
+    --lr 5e-4
 ```
+
+Notes:
+
+- Phase 1 runs in a single process by default. To shard extraction across
+  multiple GPUs, launch one process per GPU with `--shard-index <i>` and
+  `--num-shards <N>`.
+- For multi-GPU Phase 4 training, prefix the command with
+  `torchrun --nproc_per_node=<N> train_dynamicvis_bovw.py ...`.
+- Everything above is plain Python — no Slurm cluster is required.
 
 ### Phase Outputs
 
 | Phase | Script | Main Outputs |
 |---|---|---|
-| 1 | run_gpu_extract_patch_tokens.sh | outputs/patch_tokens_bovw/*.npz |
-| 2 | run_gpu_build_vocabulary.sh | outputs/bovw_vocabulary/centroids.npy, ground_cost.npy |
-| 3 | run_gpu_generate_histograms.sh | outputs/bovw_histograms/histograms.npy, cell_ids.npy |
+| 1 | scripts/extract_patch_tokens.py | outputs/patch_tokens_bovw/*.npz |
+| 2 | scripts/build_vocabulary.py | outputs/bovw_vocabulary/centroids.npy, ground_cost.npy |
+| 3 | scripts/generate_histograms.py | outputs/bovw_histograms/histograms.npy, cell_ids.npy |
 | 3b | scripts/extract_manifest_labels.py | outputs/bovw_histograms/cell_labels.npy |
-| 4 | run_gpu_bovw_training.sh | outputs/bovw_training*/final_model.pth, final_backbone.pth |
+| 4 | train_dynamicvis_bovw.py | outputs/bovw_training*/final_model.pth, final_backbone.pth |
 
-### Optional Ablation Runner
-
-```bash
-# Sequential ablations
-bash run_bovw_ablation.sh --epochs 20
-
-# Parallel job submission
-bash run_bovw_ablation.sh --parallel --epochs 20
-```
-
-## BoVW Visualizations
-
-The repository includes a consolidated visualization generator:
-
-- Script: `scripts/generate_bovw_visualizations.py`
-- GPU wrapper: `run_gpu_generate_bovw_visualizations.sh`
-- Default output folder: `outputs/visualizations/`
-
-Generate all visualizations:
-
-```bash
-# Local run
-python scripts/generate_bovw_visualizations.py
-
-# SLURM run (dynamicvis env + MIG selection)
-sbatch run_gpu_generate_bovw_visualizations.sh
-```
-
-Generate a subset with `--skip`:
-
-```bash
-# Example: run only visualization 6
-python scripts/generate_bovw_visualizations.py --skip 1,2,3,4,5,7,8
-```
-
-### What Each Visualization Signifies
-
-| Viz | Output | What It Signifies |
-|---|---|---|
-| 1 | [viz_01_histogram_gallery.png](outputs/visualizations/viz_01_histogram_gallery.png) | Diverse semantic cells and their BoVW histogram structure. Shows how different scenes activate different vocabulary distributions. |
-| 2 | [viz_02_vocabulary_gallery.png](outputs/visualizations/viz_02_vocabulary_gallery.png) | Top visual words and their most activating patches. Interprets each centroid as recurring local texture/structure patterns. |
-| 3 | [viz_03_similarity_matrix.png](outputs/visualizations/viz_03_similarity_matrix.png) | Category-level similarity structure. Compares BoVW histogram distances against pooled DINO-style similarity to show separability. |
-| 4 | [viz_04_centroid_tsne.png](outputs/visualizations/viz_04_centroid_tsne.png) | Global vocabulary geometry. Shows how centroids organize in embedding space and which classes dominate each region. |
-| 5 | [viz_05_prediction_convergence.png](outputs/visualizations/viz_05_prediction_convergence.png) | Training-stage behavior on a fixed cell. Demonstrates how predicted histograms converge across checkpoints and how EMD changes. |
-| 6 | [viz_06_spatial_heatmaps.png](outputs/visualizations/viz_06_spatial_heatmaps.png) | Spatial attention diversity. For multiple different cells, overlays top diverse centroid activations to show that clusters focus on different regions/features. |
-| 7 | [viz_07_category_prototypes.png](outputs/visualizations/viz_07_category_prototypes.png) | Category prototypes in histogram space. Summarizes class-specific BoVW signatures and intra-class compactness trends. |
-| 8 | [viz_08_cluster_similarity.png](outputs/visualizations/viz_08_cluster_similarity.png) | Near-vs-far cluster semantics at patch level. Uses auto-selected near and far centroid pairs to show patch similarity for close clusters and contrast for distant ones. |
-
-Notes:
-
-- All figures are saved as 300-DPI PNGs.
-- The script is fault-tolerant per visualization (one failure does not stop the rest).
-- If `outputs/bovw_checkpoints` is missing, checkpoint-dependent steps auto-fallback to an available `outputs/bovw_training*` directory.
 
 ## Downstream Evaluation (eval/)
-
-The repository includes four downstream evaluation tracks for transferred
-DynamicVis representations.
 
 ### 1) CBIR Retrieval (AID / ForestNet)
 
 Entry point:
 
 - eval/cbir/main.py
-- Wrapper: run_gpu_cbir_eval.sh
 
 What it does:
 
@@ -184,20 +174,22 @@ What it does:
 - Builds or loads a FAISS index.
 - Reports Recall@K and mAP@K.
 
-Example commands:
+Run commands:
 
 ```bash
 # AID retrieval (stratified k-fold)
-sbatch run_gpu_cbir_eval.sh \
+python eval/cbir/main.py \
     --dataset aid \
-    --data-dir data/eval/AID \
-    --checkpoint outputs/bovw_training_8262/epoch_20.pth
+    --data_dir data/eval/AID \
+    --model_path outputs/bovw_training_8262/epoch_20.pth \
+    --config_path architectures/DynamicVis/configs_DynamicVis/AID/dynamicvis_b_aid_mamba.py
 
 # ForestNet retrieval
-sbatch run_gpu_cbir_eval.sh \
+python eval/cbir/main.py \
     --dataset forestnet \
-    --data-dir data/eval/deep/downloads/ForestNetDataset \
-    --checkpoint outputs/bovw_training_8262/epoch_20.pth
+    --data_dir data/eval/deep/downloads/ForestNetDataset \
+    --model_path outputs/bovw_training_8262/epoch_20.pth \
+    --config_path architectures/DynamicVis/configs_DynamicVis/AID/dynamicvis_b_aid_mamba.py
 ```
 
 ### 2) UC Merced Scene Classification
@@ -205,7 +197,6 @@ sbatch run_gpu_cbir_eval.sh \
 Entry point:
 
 - eval/ucmerced/main.py
-- Wrapper: run_gpu_ucmerced_eval.sh
 
 What it does:
 
@@ -214,19 +205,19 @@ What it does:
 - Trains a lightweight linear/MLP head.
 - Reports Top-1/Top-5, precision, recall, F1.
 
-Example commands:
+Run commands:
 
 ```bash
 # Fixed split
-sbatch run_gpu_ucmerced_eval.sh \
-    --checkpoint outputs/bovw_training_8262/epoch_20.pth \
-    --split-mode fixed
+python eval/ucmerced/main.py \
+    --model_path outputs/bovw_training_8262/epoch_20.pth \
+    --split_mode fixed
 
 # Stratified k-fold
-sbatch run_gpu_ucmerced_eval.sh \
-    --checkpoint outputs/bovw_training_8262/epoch_20.pth \
-    --split-mode kfold \
-    --num-folds 5
+python eval/ucmerced/main.py \
+    --model_path outputs/bovw_training_8262/epoch_20.pth \
+    --split_mode kfold \
+    --num_folds 5
 ```
 
 ### 3) LEVIR-CD Change Detection
@@ -234,7 +225,6 @@ sbatch run_gpu_ucmerced_eval.sh \
 Entry point:
 
 - eval/change-detection/main.py
-- Wrapper: run_gpu_change_detection_eval.sh
 
 What it does:
 
@@ -242,33 +232,26 @@ What it does:
 - Adds an FPN-style fusion neck and CD prediction head.
 - Trains/evaluates on LEVIR-CD with precision/recall/F1/IoU metrics.
 
-Example commands:
+Run commands:
 
 ```bash
 # Train + evaluate
-sbatch run_gpu_change_detection_eval.sh \
+python eval/change-detection/main.py \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
-    --epochs 5
+    --num-epochs 5
 
 # Evaluate only from saved CD checkpoint
-sbatch run_gpu_change_detection_eval.sh \
+python eval/change-detection/main.py \
     --eval-only \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
-    --cd-checkpoint outputs/change_detection/best_cd_model.pth
+    --cd-checkpoint-path outputs/change_detection/best_cd_model.pth
 ```
-
-Typical change-detection artifacts:
-
-- outputs/change_detection/best_cd_model.pth
-- outputs/change_detection/training_curves.png
-- outputs/change_detection/predictions.png
 
 ### 4) LEVIR-ship Object Detection
 
 Entry point:
 
 - eval/object-detection/main.py
-- Wrapper: run_gpu_object_detection_eval.sh
 
 What it does:
 
@@ -276,53 +259,38 @@ What it does:
 - Trains/evaluates on LEVIR-ship YOLO-format labels.
 - Reports mAP at multiple IoU thresholds and saves prediction visualizations.
 
-Example commands:
+Run commands:
 
 ```bash
 # Train + evaluate on LEVIR-ship
-sbatch run_gpu_object_detection_eval.sh \
+python eval/object-detection/main.py \
     --data-root data/eval/object-det \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
     --num-epochs 5
 
 # Evaluate only from a saved detector checkpoint
-sbatch run_gpu_object_detection_eval.sh \
+python eval/object-detection/main.py \
     --eval-only \
     --data-root data/eval/object-det \
     --backbone-checkpoint outputs/bovw_training_8262/epoch_20.pth \
     --detector-checkpoint outputs/object_detection/best_detector.pth
 ```
 
-Typical object-detection artifacts:
 
-- outputs/object_detection/best_detector.pth
-- outputs/object_detection/last_detector.pth
-- outputs/object_detection/metrics.txt
-- outputs/object_detection/predictions/*.png
 
-## In-Domain fMoW Evaluation Scripts
+## Other Training Modes
 
-```bash
-# Evaluate a DynamicVis checkpoint on fMoW
-python evaluate_dynamicvis.py --checkpoint /path/to/checkpoint.pth
+- Vanilla pretrain (bbox-supervised DynamicVis):
 
-# Evaluate pretrain-style model with RoI/FPN flow
-python evaluate_dynamicvis_pretrain.py --checkpoint /path/to/checkpoint.pth
-```
+  ```bash
+  python train_dynamicvis_pretrain.py configs_dynamicvis/fmow_pretrain/dynamicvis_b_fmow_s3_pretrain.py \
+      --work-dir outputs/fmow_dynamicvis_b_s3 \
+      --batch-size 128 \
+      --epochs 100 \
+      --lr 1e-4
+  ```
 
-## Other Training Modes In Repo
+  For multi-GPU training, prefix with `torchrun --nproc_per_node=<N>` and add
+  `--launcher pytorch`.
 
-- Vanilla pretrain (bbox-supervised DynamicVis): run_gpu_dynamicvis_training.sh
-- Composition/QSACL experiments: train_dynamicvis_composition.py and related configs
 
-These remain available, but the BoVW pipeline above is the current main path.
-
-## Infrastructure Notes
-
-- SLURM wrappers auto-activate the dynamicvis conda environment.
-- Wrappers also auto-check/clone architectures/DynamicVis when missing.
-- PYTHONPATH is set to include both repository root and architectures/DynamicVis.
-
-## More Detail
-
-For deeper architecture and loss documentation, see CONTEXT.md.
