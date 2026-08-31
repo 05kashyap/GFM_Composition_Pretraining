@@ -5,6 +5,7 @@ outputs
 logs
 data/eval
 legacy_scripts
+temp_scripts
 wandb
 object-det
 # Local model weights (keep out of git)
