@@ -3,7 +3,7 @@
 [![Paper](https://img.shields.io/badge/Paper-SIGSPATIAL%202026-blue)](#citation)
 [![License](https://img.shields.io/badge/License-MIT-green)](#license)
 
-Official code release for our SIGSPATIAL '26 short paper. This repository implements a composition-aware pretraining framework for geospatial foundation models: each satellite image cell is mapped to a histogram describing its fractional land-cover makeup (the **composition target**), which is distilled into the backbone via Earth Mover's Distance. This encourages the model to reason about scenes as mixtures of land-cover types rather than single dominant concepts, yielding strong gains on region-level understanding tasks (zero-shot retrieval, scene classification) while remaining competitive on pixel-level tasks (segmentation, detection).
+Official code release for our ACM SIGSPATIAL 2026 work. This repository implements a composition-aware pretraining framework for geospatial foundation models: each satellite image cell is mapped to a histogram describing its fractional land-cover makeup (the **composition target**), which is distilled into the backbone via Earth Mover's Distance. This encourages the model to reason about scenes as mixtures of land-cover types rather than single dominant concepts, yielding strong gains on region-level understanding tasks (zero-shot retrieval, scene classification) while remaining competitive on pixel-level tasks (segmentation, detection).
 
 ![Methodology](figures/Methodology_Short.png)
 
@@ -273,3 +273,20 @@ If you find this work useful, please cite:
 ## Acknowledgments
 
 This work builds on [DynamicVis](https://github.com/KyanChen/DynamicVis) and [DINOv3](https://github.com/facebookresearch/dinov3). We thank the authors of both projects for releasing their code and pretrained weights.
+
+## Citation
+
+If you find this repo useful, please cite:
+
+```
+@article{naveen2026composition,
+  title={A Composition-Aware Pretraining Framework for Geospatial Foundation Models}, 
+  author={Aryan Kashyap Naveen and Abhishek Srinivas and Pranav Moothedath and Shrutilipi Bhattacharjee},
+  year={2026},
+  eprint={2608.30817},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  note={arXiv preprint arXiv:2608.30817}
+}
+```
+
