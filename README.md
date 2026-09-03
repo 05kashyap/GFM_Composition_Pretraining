@@ -259,26 +259,9 @@ python train_dynamicvis_pretrain.py configs_dynamicvis/fmow_pretrain/dynamicvis_
 For multi-GPU training, prefix with `torchrun --nproc_per_node=<N>` and add `--launcher pytorch`.
 
 ## Citation
-ADD
 If you find this work useful, please cite:
 
 ```bibtex
-
-```
-
-## License
-
-<!-- TODO: confirm and link the license this repository is released under (e.g., MIT, Apache-2.0). -->
-
-## Acknowledgments
-
-This work builds on [DynamicVis](https://github.com/KyanChen/DynamicVis) and [DINOv3](https://github.com/facebookresearch/dinov3). We thank the authors of both projects for releasing their code and pretrained weights.
-
-## Citation
-
-If you find this repo useful, please cite:
-
-```
 @article{naveen2026composition,
   title={A Composition-Aware Pretraining Framework for Geospatial Foundation Models}, 
   author={Aryan Kashyap Naveen and Abhishek Srinivas and Pranav Moothedath and Shrutilipi Bhattacharjee},
@@ -288,5 +271,10 @@ If you find this repo useful, please cite:
   primaryClass={cs.CV},
   note={arXiv preprint arXiv:2608.30817}
 }
+
 ```
+
+## Acknowledgments
+
+This work builds on [DynamicVis](https://github.com/KyanChen/DynamicVis) and [DINOv3](https://github.com/facebookresearch/dinov3). We thank the authors of both projects for releasing their code and pretrained weights.
 
