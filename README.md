@@ -147,7 +147,6 @@ python train_dynamicvis_bovw.py \
 
 - Phase 1 runs in a single process by default. To shard extraction across multiple GPUs, launch one process per GPU with `--shard-index <i>` and `--num-shards <N>`.
 - For multi-GPU Phase 4 training, prefix the command with `torchrun --nproc_per_node=<N> train_dynamicvis_bovw.py ...`.
-- Everything above is plain Python — no Slurm cluster is required.
 
 ### Phase Outputs
 
@@ -161,7 +160,7 @@ python train_dynamicvis_bovw.py \
 
 ## Downstream Evaluation (`eval/`)
 
-All evaluation scripts freeze the pretrained backbone and train only a lightweight, task-specific head, so reported numbers reflect representation quality rather than fine-tuning capacity.
+All evaluation scripts freeze the pretrained backbone and train only a lightweight, task-specific head.
 
 ### 1. CBIR Retrieval (AID / ForestNet)
 
